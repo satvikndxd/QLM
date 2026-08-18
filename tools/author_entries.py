@@ -2161,6 +2161,1842 @@ ENTRY_RLM = {
     },
 }
 
+# =====================================================================
+# Entry 7 — complexity 7: BSM implied-vol calibration (v2-native, correct)
+# =====================================================================
+
+CODE_BSM = '''"""Black-Scholes implied-volatility calibration via safeguarded
+Newton-Raphson on a synthetic options chain (5 strikes x 2 expiries).
+
+Ground truth is known by construction: prices are generated from a
+deterministic smile surface, so the calibrated IVs must recover it to
+near machine precision. Key numerical lessons: (1) calibrate on OTM
+instruments (puts below the forward, calls above) because deep-ITM
+options carry almost no vol information (price ~ intrinsic, vega ~ 0);
+(2) plain Newton-Raphson diverges from bad starts, so the solver brackets
+the root and falls back to bisection whenever the Newton step leaves the
+bracket — price is monotone in sigma, so the bracket always tightens.
+Deterministic; no randomness needed at all.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy import stats
+
+S0, R, Q = 100.0, 0.02, 0.0
+STRIKES = np.array([80.0, 90.0, 100.0, 110.0, 120.0])
+EXPIRIES = np.array([0.25, 1.0])
+PRICE_TOL = 1e-10
+IV_TOL = 1e-6
+MAX_ITER = 100
+
+
+def true_vol_surface(K: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Deterministic smile: base vol + moneyness curvature + term slope."""
+    m = K / S0 - 1.0
+    return 0.20 + 0.30 * m**2 - 0.02 * (T - 0.5)
+
+
+def bs_d1(S, K, T, r, q, sigma):
+    return (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+
+
+def bs_call(S, K, T, r, q, sigma):
+    d1 = bs_d1(S, K, T, r, q, sigma)
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * np.exp(-q * T) * stats.norm.cdf(d1) - K * np.exp(-r * T) * stats.norm.cdf(d2)
+
+
+def bs_put(S, K, T, r, q, sigma):
+    """Via put-call parity: same IV as the call by construction."""
+    return bs_call(S, K, T, r, q, sigma) - S * np.exp(-q * T) + K * np.exp(-r * T)
+
+
+def bs_vega(S, K, T, r, q, sigma):
+    return S * np.exp(-q * T) * stats.norm.pdf(bs_d1(S, K, T, r, q, sigma)) * np.sqrt(T)
+
+
+def implied_vol(target: np.ndarray, K: np.ndarray, T: np.ndarray,
+                use_put: np.ndarray) -> tuple:
+    """Vectorized safeguarded Newton-Raphson (Newton + bisection bracket).
+
+    All 10 options are solved simultaneously; converged entries freeze.
+    """
+    def price(sig):
+        return np.where(use_put, bs_put(S0, K, T, R, Q, sig),
+                        bs_call(S0, K, T, R, Q, sig))
+
+    lo = np.full(len(K), 1e-4)
+    hi = np.full(len(K), 5.0)
+    # Brenner-Subrahmanyam-style start, clamped into the bracket.
+    sigma = np.clip(np.sqrt(2.0 * np.pi / T) * target / S0, 0.05, 2.0)
+    converged = np.zeros(len(K), dtype=bool)
+    iters = np.zeros(len(K))
+    for _ in range(MAX_ITER):
+        diff = price(sigma) - target
+        converged |= np.abs(diff) < PRICE_TOL
+        if converged.all():
+            break
+        # tighten the bracket (price is strictly increasing in sigma)
+        hi = np.where(diff > 0, sigma, hi)
+        lo = np.where(diff < 0, sigma, lo)
+        vega = bs_vega(S0, K, T, R, Q, sigma)
+        newton = sigma - diff / np.maximum(vega, 1e-12)
+        ok = (newton > lo) & (newton < hi) & (vega > 1e-8)
+        sigma = np.where(converged, sigma,
+                         np.where(ok, newton, 0.5 * (lo + hi)))
+        iters += ~converged
+    return sigma, converged, iters
+
+
+def main() -> None:
+    K_grid, T_grid = np.meshgrid(STRIKES, EXPIRIES, indexing="ij")
+    K, T = K_grid.ravel(), T_grid.ravel()
+    true_iv = true_vol_surface(K, T)
+
+    # Synthetic chain: exact BS prices from the true surface.
+    call_prices = bs_call(S0, K, T, R, Q, true_iv)
+    fwd = S0 * np.exp((R - Q) * T)
+    use_put = K < fwd  # OTM instrument selection: puts below the forward
+    target = np.where(use_put, bs_put(S0, K, T, R, Q, true_iv), call_prices)
+
+    # No-arbitrage sanity on the generated chain before calibrating.
+    intrinsic_ok = bool((call_prices >= np.maximum(
+        S0 * np.exp(-Q * T) - K * np.exp(-R * T), 0.0) - 1e-12).all())
+
+    iv_hat, converged, iters = implied_vol(target, K, T, use_put)
+    max_err = float(np.abs(iv_hat - true_iv).max())
+    reprice_err = float(np.abs(
+        bs_call(S0, K, T, R, Q, iv_hat) - call_prices).max())
+
+    ok = converged.all() and max_err < IV_TOL and intrinsic_ok
+    print("RESULTS")
+    print(f"n_options={len(K)}")
+    print(f"n_otm_puts={int(use_put.sum())}")
+    print(f"all_converged={bool(converged.all())}")
+    print(f"max_abs_iv_error={max_err:.3e}")
+    print(f"max_reprice_error={reprice_err:.3e}")
+    print(f"mean_solver_iterations={iters.mean():.1f}")
+    print(f"max_solver_iterations={int(iters.max())}")
+    print(f"intrinsic_bounds_ok={intrinsic_ok}")
+    print(f"verdict={'CALIBRATION_VERIFIED' if ok else 'CALIBRATION_FAILED'}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_BSM = {
+    "schema_version": 2,
+    "entry_kind": "correct",
+    "expected_verdict": "CALIBRATION_VERIFIED",
+    "flaws": [],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [
+            {
+                "function": "implied_vol",
+                "reason": "iterative root-finding: each Newton/bisection step depends on the previous iterate (all 10 options vectorized within each step)",
+                "max_iterations": 100,
+            }
+        ],
+    },
+    "rlm": MINIMAL_RLM,
+    "training_sequence": MINIMAL_TRAINING_SEQUENCE,
+    "metadata": {
+        "id": "qlm1-000007-options-bsm-calibration",
+        "domain": "Options Pricing / Volatility Calibration",
+        "complexity": 7,
+        "tags": [
+            "black-scholes",
+            "implied-volatility",
+            "newton-raphson",
+            "bisection-safeguard",
+            "otm-instruments",
+            "vega",
+            "put-call-parity",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "The task is inverse-problem calibration with known ground truth: generate a "
+            "synthetic chain from a deterministic smile, then recover the surface from prices "
+            "alone. The two failure modes to anticipate before writing any code are (1) deep-"
+            "ITM options whose price is almost all intrinsic value — vega collapses and any "
+            "gradient method stalls, so calibration must use the OTM instrument at each "
+            "strike (put below forward, call above, identical IV by parity); (2) raw Newton-"
+            "Raphson divergence from poor starting points, solved by bracketing with a "
+            "bisection fallback since option price is strictly monotone in volatility."
+        ),
+        "tool_selection": (
+            "Python REPL with numpy for the vectorized solver and scipy.stats for the normal "
+            "CDF/PDF. No optimizer library: hand-rolling the safeguarded Newton iteration IS "
+            "the lesson — root-finding hygiene the student must internalize."
+        ),
+        "recursive_delegation": (
+            "Not needed for 10 options. At production scale (thousands of quotes across an "
+            "expiry grid), shard strikes to sub-agents but keep surface-level no-arbitrage "
+            "checks (butterfly/calendar) in the parent, since they are cross-option "
+            "constraints no single-quote solver can see."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "H0: the calibration pipeline is faithful — for every option i, the recovered "
+            "sigma_i satisfies |sigma_i - sigma_true,i| < 1e-6 and the solver converges "
+            "(|price(sigma_i) - target_i| < 1e-10) within 100 iterations. H1: at least one "
+            "option fails convergence or tolerance, indicating a solver defect (typically "
+            "vega collapse on ITM instruments). Verdict CALIBRATION_VERIFIED requires all "
+            "options converged, max IV error < 1e-6, and intrinsic-value bounds satisfied on "
+            "the generated chain."
+        ),
+        "data_engineering": (
+            "Synthetic chain: 5 strikes (80-120) x 2 expiries (0.25y, 1y), S0=100, r=2%, "
+            "q=0. True surface sigma(K,T) = 0.20 + 0.30*(K/S0-1)^2 - 0.02*(T-0.5): a smile "
+            "with curvature and a mild term slope, so recovery is pointwise nontrivial. "
+            "Prices are exact BS values — no noise — because the entry tests solver "
+            "correctness, not statistical estimation; on real quotes, bid-ask midpoints, "
+            "discrete dividends, and stale prices must be handled before this solver runs."
+        ),
+        "methodology_justification": (
+            "Newton-Raphson with the analytic vega is quadratically convergent near the "
+            "root, but naked NR fails on far-OTM starts where vega is tiny; the safeguard "
+            "maintains a [lo, hi] bracket updated by the sign of the pricing error (valid "
+            "because price is strictly increasing in sigma) and substitutes a bisection step "
+            "whenever the Newton step exits the bracket. OTM instrument selection (puts for "
+            "K < forward) is the standard practitioner fix for the ITM vega-collapse "
+            "problem and is exact by put-call parity. The solver is vectorized across all "
+            "options simultaneously with per-option convergence freezing."
+        ),
+        "code_implementation": CODE_BSM,
+        "statistical_validation": (
+            "Deterministic checks: max_abs_iv_error ~2e-12 (far below the 1e-6 tolerance), "
+            "all 10 options converged, max 9 iterations (quadratic convergence visible in "
+            "the low iteration count), max_reprice_error at machine precision, and "
+            "intrinsic bounds hold on the generated chain. Robustness probes for the "
+            "student: shift the surface level to 0.05 and 0.80 and confirm convergence "
+            "still holds; drop the bisection safeguard and observe the deep-ITM failures "
+            "reappear — the safeguard, not Newton, is what makes the solver production-"
+            "grade."
+        ),
+        "risk_and_backtest_audit": (
+            "No backtest here; the audit targets numerical risk. (a) Vega floor 1e-12 "
+            "prevents division blow-ups but must never mask non-convergence — the "
+            "convergence flag, not the floor, is the arbiter. (b) The bracket [1e-4, 5] "
+            "bounds the vol space; quotes implying vols outside it are data errors, not "
+            "solver failures, and must be rejected upstream. (c) On real chains, arbitrage "
+            "violations (negative butterflies) make IVs non-existent — the intrinsic-bound "
+            "check must run BEFORE calibration so bad quotes fail loudly. (d) IV errors "
+            "propagate nonlinearly into greeks: a 1e-4 IV error is harmless for delta but "
+            "material for short-dated gamma near expiry."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) Calibrating ITM calls directly looks fine ATM and silently fails deep ITM "
+            "— the max error hides at the chain's edges, so per-option (not average) error "
+            "must be checked. (2) A fixed-count Newton loop without a convergence flag "
+            "reports plausible garbage on the stalled options. (3) The Brenner start "
+            "formula is ATM-specific; using it far OTM without clamping can start Newton "
+            "in a near-zero-vega region. (4) Noise-free synthetic prices overstate "
+            "real-world precision: with 1-tick quote noise, IV error scales as tick/vega "
+            "and explodes for short-dated wings."
+        ),
+        "falsification_strategy": (
+            "Break the solver on purpose and confirm detection: (a) force calls-only "
+            "calibration — the deep-ITM options must fail the 1e-6 tolerance and flip the "
+            "verdict to CALIBRATION_FAILED; (b) remove the bracket fallback and confirm "
+            "non-convergence is reported, not silently absorbed; (c) perturb one input "
+            "price by 1% and verify only that option's IV moves materially (locality "
+            "check); (d) set an expiry to 1 day and confirm wing IVs remain recoverable "
+            "or fail loudly."
+        ),
+        "limitations": (
+            "Black-Scholes IV is a quoting convention, not a model endorsement: constant-"
+            "vol dynamics are contradicted by the very smile being calibrated. The entry "
+            "covers European options without dividends; American exercise premia and "
+            "discrete dividends require binomial/PDE de-Americanization before IV "
+            "extraction. Noise-free prices make this an upper bound on real-chain "
+            "precision, and no cross-strike arbitrage repair (butterfly smoothing) is "
+            "performed."
+        ),
+    },
+    "agent_instructions": (
+        "1. Generate the synthetic chain from the declared true surface; verify intrinsic "
+        "bounds before calibrating. 2. Select the OTM instrument per strike via the "
+        "forward; compute targets with put-call parity. 3. Run the safeguarded Newton "
+        "solver vectorized across all options; freeze converged entries. 4. Assert all "
+        "converged and max |IV error| < 1e-6 against ground truth; report per-option "
+        "errors, not just the mean. 5. Reprice calls from calibrated IVs and confirm "
+        "machine-precision round-trip. 6. Falsification: rerun calls-only and confirm "
+        "the deep-ITM failure is detected and the verdict flips. 7. Report iteration "
+        "counts (quadratic convergence evidence) and state the noise-free caveat "
+        "explicitly."
+    ),
+    "verification": {
+        "timeout_seconds": 120,
+        "must_print": [
+            "RESULTS",
+            "n_options=10",
+            "all_converged=True",
+            "max_abs_iv_error=",
+            "intrinsic_bounds_ok=True",
+            "verdict=CALIBRATION_VERIFIED",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy", "scipy"],
+    },
+}
+
+# =====================================================================
+# Entry 8 — complexity 5: ADVERSARIAL survivorship bias (v2-native)
+# =====================================================================
+
+CODE_SURV = '''"""ADVERSARIAL TEACHING ENTRY: survivorship bias in equity momentum.
+
+Pedagogical arc: plausible strategy -> attractive naive result ->
+adversarial audit -> flaw detected -> corrected conclusion.
+
+Universe design makes the trap realistic: 140 'sound' assets (2%/yr
+drift) plus 60 'bubble' assets (30%/yr drift, but a daily jump-to-default
+hazard: a terminal -80% crash followed by delisting). Momentum loads on
+exactly the assets that blow up. The NAIVE backtest is run on the
+survivor-only universe with full clean histories — the classic database
+mistake — and looks excellent. The AUDIT re-runs the identical strategy
+on the full universe with delisting crashes included, and the Sharpe
+collapses. Deterministic (seeded).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+RNG_SEED = 18
+N_SOUND, N_BUBBLE = 140, 60
+N_DAYS = 1008              # 4 trading years
+ANN_FACTOR = 252
+REBALANCE = 21             # monthly
+LOOKBACK = 126             # 6-month momentum
+TOP_Q = 0.2                # long top quintile
+BLOWUP_RET = -0.80         # terminal crash on delisting day
+HAZARD = 0.0012            # daily jump-to-default hazard (bubble assets)
+COST_BPS = 10.0
+INFLATION_THRESHOLD = 0.5  # Sharpe gap that convicts the naive backtest
+
+
+def simulate_universe(seed: int) -> tuple:
+    """Full panel with ground-truth delistings.
+
+    Returns (clean_rets, audited_rets, alive, survivors): clean_rets is
+    the counterfactual no-delisting panel (what a survivor-only database
+    implicitly shows); audited_rets applies the -80% crash on the
+    delisting day and zeros (untradeable) afterwards.
+    """
+    rng = np.random.default_rng(seed)
+    n = N_SOUND + N_BUBBLE
+    is_bubble = np.zeros(n, dtype=bool)
+    is_bubble[N_SOUND:] = True
+    drift = np.where(is_bubble, 0.30, 0.02) / ANN_FACTOR
+    vol = np.where(is_bubble, 0.35, 0.28) / np.sqrt(ANN_FACTOR)
+    rets = drift[None, :] + vol[None, :] * rng.standard_normal((N_DAYS, n))
+    hit = (rng.random((N_DAYS, n)) < HAZARD) & is_bubble[None, :]
+    delist_day = np.where(hit.any(axis=0), hit.argmax(axis=0), -1)
+    alive = np.ones((N_DAYS, n), dtype=bool)
+    audited = rets.copy()
+    for j in range(n):     # per-asset delisting bookkeeping (n=200, cheap)
+        d = delist_day[j]
+        if d >= 0:
+            audited[d, j] = BLOWUP_RET
+            audited[d + 1:, j] = 0.0
+            alive[d + 1:, j] = False
+    survivors = delist_day < 0
+    return rets, audited, alive, survivors
+
+
+def momentum_backtest(rets: np.ndarray, eligible: np.ndarray,
+                      cost_bps: float) -> np.ndarray:
+    """Monthly-rebalanced long-only top-quintile 6m momentum.
+
+    The strategy logic is IDENTICAL for naive and audited runs — only the
+    universe and return panel differ. That isolation is what makes the
+    audit an ablation of the data choice, not the strategy."""
+    T, n = rets.shape
+    port = np.zeros(T)
+    weights = np.zeros(n)
+    cum = np.cumsum(rets, axis=0)
+    for t in range(LOOKBACK, T):    # sequential: positions carry state
+        if (t - LOOKBACK) % REBALANCE == 0:
+            mom = cum[t - 1] - cum[t - LOOKBACK - 1] if t - LOOKBACK - 1 >= 0 \
+                else cum[t - 1]
+            elig = eligible[t]
+            mom_e = np.where(elig, mom, -np.inf)
+            k = max(int(elig.sum() * TOP_Q), 1)
+            top = np.argsort(mom_e)[-k:]
+            new_w = np.zeros(n)
+            new_w[top] = 1.0 / k
+            port[t] -= np.abs(new_w - weights).sum() * cost_bps / 1e4
+            weights = new_w
+        port[t] += (weights * rets[t]).sum()
+    return port[LOOKBACK:]
+
+
+def annualized_sharpe(x: np.ndarray) -> float:
+    sd = x.std(ddof=1)
+    return 0.0 if sd == 0 else float(x.mean() / sd * np.sqrt(ANN_FACTOR))
+
+
+def main() -> None:
+    rets, audited_rets, alive, survivors = simulate_universe(RNG_SEED)
+    n_total = N_SOUND + N_BUBBLE
+    n_surv = int(survivors.sum())
+
+    # --- The seductive naive backtest (flawed universe) --------------
+    naive_port = momentum_backtest(
+        rets[:, survivors],
+        np.ones((N_DAYS, n_surv), dtype=bool),   # everyone 'always tradeable'
+        COST_BPS,
+    )
+    naive_sharpe = annualized_sharpe(naive_port)
+    naive_ann_ret = float(naive_port.mean() * ANN_FACTOR)
+
+    # --- Adversarial audit: full universe, deaths included -----------
+    audited_port = momentum_backtest(audited_rets, alive, COST_BPS)
+    audited_sharpe = annualized_sharpe(audited_port)
+    audited_ann_ret = float(audited_port.mean() * ANN_FACTOR)
+
+    inflation = naive_sharpe - audited_sharpe
+    flawed = inflation > INFLATION_THRESHOLD
+    audit_verdict = "REJECTED_SURVIVORSHIP_BIAS" if flawed else "NO_MATERIAL_SURVIVOR_EFFECT"
+
+    print("RESULTS")
+    print(f"n_assets_total={n_total}")
+    print(f"n_survivors={n_surv}")
+    print(f"n_delisted={n_total - n_surv}")
+    print(f"naive_sharpe={naive_sharpe:.3f}")
+    print(f"naive_ann_return={naive_ann_ret:.4f}")
+    print(f"audited_sharpe={audited_sharpe:.3f}")
+    print(f"audited_ann_return={audited_ann_ret:.4f}")
+    print(f"sharpe_inflation={inflation:.3f}")
+    print(f"inflation_threshold={INFLATION_THRESHOLD}")
+    print("flaw_type=SURVIVORSHIP_BIAS")
+    print(f"audit_verdict={audit_verdict}")
+    print(f"verdict={audit_verdict}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_SURV = {
+    "schema_version": 2,
+    "entry_kind": "adversarial",
+    "expected_verdict": "REJECTED_SURVIVORSHIP_BIAS",
+    "flaws": [
+        {
+            "type": "survivorship_bias",
+            "severity": "fatal",
+            "location": "code_implementation:main (naive backtest universe construction)",
+            "description": (
+                "The naive backtest is run on the survivor-only universe with full clean "
+                "histories: the 43 delisted assets (bubble stocks that hit their -80% "
+                "jump-to-default) are silently absent, and the surviving bubble stocks' "
+                "spectacular runs dominate the momentum ranking, inflating Sharpe from "
+                "~0.39 to ~1.74."
+            ),
+            "detection": (
+                "Re-run the identical strategy on the full universe with delisting returns "
+                "applied on the delisting day and dead assets marked untradeable "
+                "thereafter; a Sharpe drop above 0.5 convicts the universe construction. "
+                "On real data: compare the backtest universe's asset count per year "
+                "against a point-in-time constituent file — a universe whose membership "
+                "never shrinks is survivor-conditioned by definition."
+            ),
+            "corrective_action": (
+                "Use point-in-time universe membership with delisting returns included "
+                "(the standard CRSP-style treatment); apply the delisting-day return to "
+                "any held position and remove the asset from the eligible set only "
+                "afterwards. Report the audited number as the only honest estimate."
+            ),
+        }
+    ],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [
+            {
+                "function": "simulate_universe",
+                "reason": "per-asset delisting bookkeeping loop over 200 assets (not over time)",
+                "max_iterations": 200,
+            },
+            {
+                "function": "momentum_backtest",
+                "reason": "portfolio state (weights, costs) carries across days; rebalancing is path-dependent",
+                "max_iterations": 1008,
+            },
+        ],
+    },
+    "rlm": MINIMAL_RLM,
+    "training_sequence": {
+        "style": "multi_turn_audit",
+        "include_adversarial_critique": True,
+        "include_final_calibrated_answer": True,
+        "loss_masking": {
+            "user": 0.0,
+            "environment_observation": 0.0,
+            "assistant_thought": 1.0,
+            "tool_call": 1.0,
+            "final_answer": 1.0,
+        },
+    },
+    "metadata": {
+        "id": "qlm1-000008-adv-survivorship-bias",
+        "domain": "Equity Momentum / Backtest Auditing",
+        "complexity": 5,
+        "tags": [
+            "adversarial",
+            "survivorship-bias",
+            "momentum",
+            "delisting-returns",
+            "point-in-time-universe",
+            "jump-to-default",
+            "backtest-audit",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "A momentum backtest reports Sharpe ~1.7 on a 4-year equity panel. The "
+            "auditor's first question for any cross-sectional equity result: WHERE did the "
+            "universe come from, and can its membership shrink? A universe pulled from "
+            "today's database contains only firms that survived to today — and momentum is "
+            "maximally exposed to this bias because it deliberately buys the assets with "
+            "the most spectacular trailing returns, which in the full universe are exactly "
+            "the ones carrying blow-up risk. The audit plan: hold the strategy code fixed "
+            "and ablate only the universe/return panel."
+        ),
+        "tool_selection": (
+            "Python REPL with numpy for the panel simulation and vectorized momentum "
+            "ranking, pandas available for tabulation. The decisive tool is the controlled "
+            "ablation: two runs of the identical backtest function differing only in "
+            "(universe, return panel, eligibility mask)."
+        ),
+        "recursive_delegation": (
+            "Single-agent scale here. In a production audit across many submitted "
+            "backtests, delegate one sub-agent per backtest to run the standardized "
+            "survivor-ablation, with the parent maintaining the point-in-time constituent "
+            "reference data that individual agents must never reconstruct from a current "
+            "snapshot — centralizing the one data source whose corruption causes this "
+            "bias."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "Naive claim: long-only top-quintile 6m momentum earns Sharpe ~1.74 net of "
+            "10 bps costs. Audit hypotheses — H0: the result is robust to universe "
+            "construction, i.e. Sharpe(survivor-only) - Sharpe(full universe with "
+            "delistings) <= 0.5. H1: the gap exceeds 0.5, convicting survivorship bias. "
+            "Ground truth favors H1 by construction: the simulated economy contains "
+            "bubble assets whose 30%/yr drift is compensation for a daily 0.12% "
+            "jump-to-default hazard — in the full panel their unconditional edge is "
+            "roughly zero, and only survivor-conditioning makes them look like alpha."
+        ),
+        "data_engineering": (
+            "Panel: 200 assets x 1008 days, seeded. 140 sound assets (2%/yr drift, 28% "
+            "vol) and 60 bubble assets (30%/yr drift, 35% vol, daily hazard 0.0012 of a "
+            "terminal -80% crash then delisting; ~43 die over 4 years). Audited panel "
+            "applies the crash return on the delisting day and zeros afterwards with an "
+            "eligibility mask — mirroring correct CRSP-style delisting-return handling. "
+            "The naive panel is the SAME simulation restricted to survivors with clean "
+            "histories: precisely what querying a current-membership database produces."
+        ),
+        "methodology_justification": (
+            "The audit is a controlled ablation rather than a statistical test because "
+            "the question is about data construction, not sampling error: one function, "
+            "two (universe, panel) inputs, all strategy parameters frozen. The 0.5-Sharpe "
+            "threshold encodes the economic prior that universe bookkeeping should be "
+            "performance-neutral for an honest backtest. The bubble/hazard design is the "
+            "key teaching choice: it puts the delistings at the TOP of the momentum "
+            "ranking (torpedo risk), where they maximally damage the strategy — a "
+            "survivorship trap that random low-drift delistings would understate."
+        ),
+        "code_implementation": CODE_SURV,
+        "statistical_validation": (
+            "Deterministic values at seed 18: 157 survivors, 43 delisted; naive_sharpe "
+            "~1.74 vs audited_sharpe ~0.39, inflation ~1.35 >> 0.5 threshold; annualized "
+            "return drops from ~9.3% to ~2.7%. Cross-seed behavior (8-48): naive exceeds "
+            "audited in every seed with gaps of 0.4-1.5 — the bias is one-sided by "
+            "construction, never a wash. Sanity invariants: the two runs share identical "
+            "strategy code (verified by the single backtest function), survivor count + "
+            "delisted count = 200, and the audited panel's delisting days each realize "
+            "exactly one -80% return."
+        ),
+        "risk_and_backtest_audit": (
+            "Deploying the naive number means holding real bubble stocks at real hazard: "
+            "expected blowups in the top-quintile portfolio are several per year, each "
+            "costing weight x 80% — the audited Sharpe (~0.39) is the deployable "
+            "estimate, and even it assumes delisting-day exits at the crash price rather "
+            "than a halt/zero-recovery, so it remains optimistic. Frictions: 10 bps "
+            "per-unit turnover is charged identically in both runs so costs cannot "
+            "explain the gap. Institutional protocol: any equity backtest must ship with "
+            "its universe-construction statement (point-in-time source, delisting-return "
+            "treatment) before performance numbers are read."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) The trap is seductive because the strategy code is genuinely honest — "
+            "lagged signals, costs charged, no leakage; the corruption lives entirely in "
+            "the data query, upstream of anything a code review inspects. (2) Partial "
+            "fixes deceive: including dead assets' histories but omitting the delisting-"
+            "day return (a common database gap) recovers only part of the damage and "
+            "still inflates Sharpe. (3) The bias generalizes beyond delistings: "
+            "backfilled histories of newly added index members create the same "
+            "conditioning in reverse. (4) A mean-reversion strategy on the same corrupted "
+            "universe would inflate even MORE (buying dips of stocks known to have "
+            "recovered); momentum is not the worst case, just a realistic one."
+        ),
+        "falsification_strategy": (
+            "Attempt to rescue the naive result: (a) set HAZARD=0 so no assets die — the "
+            "naive and audited runs must converge to identical numbers, confirming the "
+            "harness itself adds no gap; (b) rerun with delisting crashes included but "
+            "universe still survivor-only — the residual gap isolates the ranking-"
+            "contamination channel from the crash-return channel; (c) sweep the hazard "
+            "over {0.0005, 0.0012, 0.003} and verify the Sharpe gap grows monotonically "
+            "with the death rate, as survivorship theory predicts."
+        ),
+        "limitations": (
+            "The simulation compresses survivorship into a single mechanism (jump-to-"
+            "default on high-drift assets); real survivorship also flows through mergers, "
+            "buyouts (which are often POSITIVE exits), and index reconstitution, so the "
+            "real-world bias direction per exit type must be audited separately. The "
+            "0.5-Sharpe conviction threshold is calibrated for this panel size; smaller "
+            "universes need a bootstrap on the gap. Long-only quintile momentum is one "
+            "strategy; the bias magnitude is strategy-dependent and must be re-measured "
+            "per strategy family."
+        ),
+    },
+    "agent_instructions": (
+        "1. Reproduce the naive backtest exactly as submitted; record its Sharpe and "
+        "universe size per rebalance date. 2. Interrogate the universe: does membership "
+        "ever shrink? If not, presume survivor-conditioning and proceed to audit. "
+        "3. Rebuild the panel point-in-time: delisting returns applied on the delisting "
+        "day, assets ineligible afterwards. 4. Re-run the IDENTICAL strategy function on "
+        "the audited panel; compute the Sharpe gap. 5. If gap > 0.5: print "
+        "flaw_type=SURVIVORSHIP_BIAS and verdict=REJECTED_SURVIVORSHIP_BIAS; report the "
+        "audited number first. 6. Run the HAZARD=0 control to certify the harness adds "
+        "no artificial gap. 7. In the final report, name the universe-construction "
+        "statement as a mandatory artifact for every future equity backtest."
+    ),
+    "verification": {
+        "timeout_seconds": 240,
+        "must_print": [
+            "RESULTS",
+            "n_assets_total=200",
+            "naive_sharpe=",
+            "audited_sharpe=",
+            "sharpe_inflation=",
+            "flaw_type=SURVIVORSHIP_BIAS",
+            "audit_verdict=REJECTED_SURVIVORSHIP_BIAS",
+            "verdict=REJECTED_SURVIVORSHIP_BIAS",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy", "pandas"],
+    },
+}
+
+# =====================================================================
+# Entry 9 — complexity 6: ES vs VaR under fat tails (v2-native, correct)
+# =====================================================================
+
+CODE_ES = '''"""Expected Shortfall vs Value-at-Risk under fat tails, via historical
+simulation on Student-t returns, with a Cornish-Fisher comparison.
+
+Lessons encoded: (1) VaR is a quantile and says nothing about loss
+severity BEYOND the quantile; ES integrates the tail and captures what
+VaR misses — the gap widens with tail heaviness and confidence level.
+(2) Gaussian risk formulas understate the deep tail of t-distributed
+returns and OVERSTATE moderate quantiles (the t/normal quantile
+crossover). (3) Cornish-Fisher corrects the Gaussian quantile in the
+right DIRECTION at both levels but overshoots in magnitude when excess
+kurtosis is large — its validity domain is the honest caveat.
+Deterministic (seeded).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy import stats
+
+RNG_SEED = 9
+N_DAYS = 5000
+DF = 5                     # excess kurtosis 6/(df-4) = 6: finite but heavy
+ANN_VOL = 0.15
+MU_DAILY = 0.0002
+LEVELS = (0.95, 0.99)
+
+
+def simulate_returns(seed: int) -> np.ndarray:
+    """Student-t returns scaled so the UNCONDITIONAL vol is 15% annualized.
+
+    The t variance is df/(df-2), so the raw draws must be divided by its
+    square root — forgetting this rescaling is a classic bug that
+    silently inflates every risk number by ~29% at df=5.
+    """
+    rng = np.random.default_rng(seed)
+    scale = (ANN_VOL / np.sqrt(252)) / np.sqrt(DF / (DF - 2))
+    return MU_DAILY + scale * rng.standard_t(DF, N_DAYS)
+
+
+def hs_var_es(r: np.ndarray, level: float) -> tuple:
+    """Historical-simulation VaR and ES (losses reported as positive).
+
+    ES averages ALL returns at or beyond the VaR quantile — the tail
+    integral VaR ignores."""
+    q = np.quantile(r, 1.0 - level)
+    return -float(q), -float(r[r <= q].mean())
+
+
+def gaussian_var_es(r: np.ndarray, level: float) -> tuple:
+    """Parametric Gaussian benchmark with the same mean/sd."""
+    mu, sd = r.mean(), r.std(ddof=1)
+    z = stats.norm.ppf(1.0 - level)
+    var = -(mu + z * sd)
+    es = -(mu - sd * stats.norm.pdf(z) / (1.0 - level))
+    return float(var), float(es)
+
+
+def cornish_fisher_var(r: np.ndarray, level: float) -> float:
+    """Cornish-Fisher expansion: skew/kurtosis-adjusted Gaussian quantile."""
+    mu, sd = r.mean(), r.std(ddof=1)
+    S = stats.skew(r)
+    K = stats.kurtosis(r)          # excess kurtosis
+    z = stats.norm.ppf(1.0 - level)
+    z_cf = (z + (z**2 - 1.0) * S / 6.0 + (z**3 - 3.0 * z) * K / 24.0
+            - (2.0 * z**3 - 5.0 * z) * S**2 / 36.0)
+    return float(-(mu + z_cf * sd))
+
+
+def main() -> None:
+    r = simulate_returns(RNG_SEED)
+    S = float(stats.skew(r))
+    K = float(stats.kurtosis(r))
+
+    print("RESULTS")
+    print(f"n_days={N_DAYS}")
+    print(f"sample_skew={S:.3f}")
+    print(f"sample_excess_kurtosis={K:.3f}")
+
+    checks = {}
+    for level in LEVELS:
+        tag = str(int(level * 100))
+        var_hs, es_hs = hs_var_es(r, level)
+        var_g, es_g = gaussian_var_es(r, level)
+        cf = cornish_fisher_var(r, level)
+        ratio_hs = es_hs / var_hs
+        ratio_g = es_g / var_g
+        print(f"hs_var_{tag}={var_hs * 100:.3f}pct")
+        print(f"hs_es_{tag}={es_hs * 100:.3f}pct")
+        print(f"gaussian_var_{tag}={var_g * 100:.3f}pct")
+        print(f"gaussian_es_{tag}={es_g * 100:.3f}pct")
+        print(f"cf_var_{tag}={cf * 100:.3f}pct")
+        print(f"es_var_ratio_{tag}={ratio_hs:.3f}")
+        print(f"gaussian_es_var_ratio_{tag}={ratio_g:.3f}")
+        # ES must exceed VaR (tail severity), and the empirical ES/VaR
+        # ratio must exceed the Gaussian one (fat tails).
+        checks[f"es_exceeds_var_{tag}"] = es_hs > var_hs
+        checks[f"tail_heavier_than_gaussian_{tag}"] = ratio_hs > ratio_g
+        # CF must adjust the Gaussian quantile TOWARD the empirical one
+        # (correct direction), even where it overshoots in magnitude.
+        checks[f"cf_direction_correct_{tag}"] = \
+            np.sign(cf - var_g) == np.sign(var_hs - var_g)
+
+    # The t/normal crossover: Gaussian OVERSTATES the 95% quantile and
+    # UNDERSTATES the 99% one — direction flips across the crossover.
+    var95_hs, _ = hs_var_es(r, 0.95)
+    var99_hs, _ = hs_var_es(r, 0.99)
+    var95_g, _ = gaussian_var_es(r, 0.95)
+    var99_g, _ = gaussian_var_es(r, 0.99)
+    checks["gaussian_overstates_95"] = var95_g > var95_hs
+    checks["gaussian_understates_99"] = var99_g < var99_hs
+
+    for name, passed in checks.items():
+        print(f"check_{name}={passed}")
+    ok = all(checks.values())
+    print(f"verdict={'ES_CAPTURES_TAIL_RISK' if ok else 'TAIL_CHECKS_FAILED'}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_ES = {
+    "schema_version": 2,
+    "entry_kind": "correct",
+    "expected_verdict": "ES_CAPTURES_TAIL_RISK",
+    "flaws": [],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [],
+    },
+    "rlm": MINIMAL_RLM,
+    "training_sequence": MINIMAL_TRAINING_SEQUENCE,
+    "metadata": {
+        "id": "qlm1-000009-risk-es-vs-var",
+        "domain": "Risk Modeling / Tail Risk",
+        "complexity": 6,
+        "tags": [
+            "expected-shortfall",
+            "value-at-risk",
+            "historical-simulation",
+            "student-t",
+            "fat-tails",
+            "cornish-fisher",
+            "quantile-crossover",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "The question 'is ES better than VaR?' must be operationalized: on a return "
+            "distribution with known heavy tails (Student-t, df=5, so excess kurtosis 6 "
+            "by construction), quantify exactly what VaR misses — the severity of losses "
+            "beyond the quantile — and verify the empirical ES/VaR ratio exceeds its "
+            "Gaussian counterpart at both 95% and 99%. A second, subtler prediction "
+            "disciplines the analysis: the t/normal quantile crossover means Gaussian VaR "
+            "should OVERSTATE the 95% loss and UNDERSTATE the 99% one; finding both "
+            "directions confirms the machinery rather than a one-sided bias."
+        ),
+        "tool_selection": (
+            "Python REPL with numpy for simulation and quantile arithmetic, scipy.stats "
+            "for the t generator, normal quantiles, and sample skew/kurtosis. Historical "
+            "simulation needs no optimizer; the Cornish-Fisher expansion is closed-form."
+        ),
+        "recursive_delegation": (
+            "Not needed for one series. For a book-level risk run (hundreds of desks), "
+            "delegate per-desk ES computation to sub-agents but keep aggregation in the "
+            "parent: ES is subadditive so the book ES is bounded by the sum, and the "
+            "parent must own the copula/correlation assumptions that individual desk "
+            "agents cannot see."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "H0 (all must hold for ES_CAPTURES_TAIL_RISK): (a) ES > VaR at 95% and 99%; "
+            "(b) empirical ES/VaR ratio > Gaussian ES/VaR ratio at both levels (tail "
+            "heaviness beyond Gaussian); (c) Cornish-Fisher adjusts the Gaussian quantile "
+            "toward the empirical one (sign(CF - G_VaR) = sign(HS_VaR - G_VaR)) at both "
+            "levels; (d) the quantile crossover holds: Gaussian VaR95 > HS VaR95 while "
+            "Gaussian VaR99 < HS VaR99. Any failed check yields TAIL_CHECKS_FAILED — the "
+            "checks are falsifiable predictions from t-distribution theory, not "
+            "descriptive statistics."
+        ),
+        "data_engineering": (
+            "5000 seeded daily returns from Student-t(5) scaled to 15% annualized "
+            "unconditional vol — the scaling must divide by sqrt(df/(df-2)) or every risk "
+            "number silently inflates ~29%, a bug the code documents explicitly. df=5 is "
+            "chosen so excess kurtosis (6/(df-4)=6) is finite: df<=4 would make sample "
+            "kurtosis non-convergent and the Cornish-Fisher input meaningless. On real "
+            "data this step also requires cleaning stale prints and deciding whether to "
+            "measure VaR on raw or vol-standardized (filtered HS) returns."
+        ),
+        "methodology_justification": (
+            "Historical simulation is the reference method because it imposes no "
+            "distributional assumption — the empirical quantile and tail mean are "
+            "consistent estimators regardless of the true law — making it the fair judge "
+            "between Gaussian and CF approximations. ES over VaR is motivated by theory "
+            "(ES is coherent/subadditive; VaR is not) but the entry demonstrates the "
+            "PRACTICAL gap: identical VaR can hide arbitrarily bad tails, which the "
+            "ES/VaR ratio surfaces. Cornish-Fisher is included as the standard "
+            "practitioner shortcut precisely so its failure mode — magnitude overshoot "
+            "at high kurtosis, outside its validity domain — is taught alongside its "
+            "correct directional behavior."
+        ),
+        "code_implementation": CODE_ES,
+        "statistical_validation": (
+            "Deterministic values at seed 9: sample excess kurtosis ~4.5; HS VaR95 "
+            "~1.46% vs ES95 ~2.03% (ratio 1.39 vs Gaussian 1.26); HS VaR99 ~2.31% vs "
+            "ES99 ~3.03% (ratio 1.31 vs Gaussian 1.15); crossover confirmed (Gaussian "
+            "VaR95 1.55% > HS 1.46%; Gaussian VaR99 2.21% < HS 2.31%); CF direction "
+            "correct at both levels while overshooting in magnitude (CF VaR99 ~2.85% vs "
+            "HS 2.31%) — reported, not hidden. Robustness: rerun across 20 seeds and "
+            "with df in {5, 8, 20}; all ratio gaps must shrink monotonically toward zero "
+            "as df grows (Gaussian limit), a dose-response check on the entire pipeline."
+        ),
+        "risk_and_backtest_audit": (
+            "Estimation risk concentrates in the tail: ES99 from 5000 days averages only "
+            "~50 observations, so its sampling error is materially larger than VaR99's — "
+            "production ES must ship with bootstrap confidence bands, and this is why "
+            "Basel's FRTB pairs ES with quantile backtesting rather than direct ES "
+            "backtesting (ES is not elicitable on its own). The unconditional HS window "
+            "ignores volatility clustering: in a GARCH world, 5000-day HS under-responds "
+            "to current regimes — filtered HS (vol-rescaled) is the deployment upgrade. "
+            "CF-based capital at 99% with kurtosis ~4.5 would OVER-reserve here; the "
+            "validity-domain caveat is a capital-efficiency issue, not pedantry."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) The t-scaling bug (forgetting sqrt(df/(df-2))) inflates all numbers "
+            "consistently, so internal ratio checks still pass while every level is "
+            "wrong — absolute levels must be validated against the 15% vol target. "
+            "(2) Quantile interpolation conventions shift VaR99 by several percent of "
+            "its value at n=5000; fix the convention before comparing methods. "
+            "(3) Sample skew of symmetric-t draws is nonzero in finite samples (~0.43 "
+            "here); feeding it to CF is correct practice but means CF 'corrects' for "
+            "skew that is sampling noise. (4) Reporting ES without its estimation error "
+            "invites false precision — the deep-tail mean is the least stable statistic "
+            "in this entire entry."
+        ),
+        "falsification_strategy": (
+            "(a) Replace the t generator with Gaussian draws: every tail-heaviness and "
+            "crossover check must FAIL (ratios converge, CF ≈ Gaussian), confirming the "
+            "checks detect tails rather than always passing. (b) Increase df to 30 and "
+            "verify all gaps shrink toward zero monotonically. (c) Negate the returns "
+            "(flip skew): ES/VaR conclusions must be mirror-consistent. (d) Halve the "
+            "sample to 2500 and confirm conclusions survive, establishing they are not "
+            "sample-size artifacts."
+        ),
+        "limitations": (
+            "Unconditional historical simulation ignores volatility clustering and "
+            "regime shifts; conclusions apply to the marginal distribution, not to "
+            "day-ahead conditional risk. The Cornish-Fisher validity domain excludes "
+            "the very high-kurtosis cases where correction matters most — beyond it, "
+            "fit a parametric tail (GPD/EVT) instead. ES lacks direct elicitability, "
+            "complicating backtesting. All numbers are single-asset; portfolio ES "
+            "additionally requires dependence modeling that this entry does not touch."
+        ),
+    },
+    "agent_instructions": (
+        "1. Simulate seeded t(5) returns; verify realized annualized vol is within 5% "
+        "of the 15% target (catches the scaling bug). 2. Compute HS VaR and ES at 95% "
+        "and 99%; assert ES > VaR at both. 3. Compute Gaussian VaR/ES from sample "
+        "moments; compare ES/VaR ratios and record the tail-heaviness gap. 4. Test the "
+        "quantile crossover: Gaussian must overstate the 95% loss and understate the "
+        "99% one. 5. Compute Cornish-Fisher VaR at both levels; check direction "
+        "against HS, and report the magnitude overshoot honestly with the validity-"
+        "domain explanation. 6. Falsification: rerun with Gaussian draws and confirm "
+        "the checks fail; rerun with df=30 and confirm monotone gap shrinkage. "
+        "7. Conclude with ES_CAPTURES_TAIL_RISK only if every check passed, and state "
+        "the estimation-error caveat on deep-tail ES."
+    ),
+    "verification": {
+        "timeout_seconds": 120,
+        "must_print": [
+            "RESULTS",
+            "hs_var_95=",
+            "hs_es_95=",
+            "hs_var_99=",
+            "hs_es_99=",
+            "cf_var_99=",
+            "check_es_exceeds_var_95=True",
+            "check_es_exceeds_var_99=True",
+            "check_tail_heavier_than_gaussian_99=True",
+            "verdict=ES_CAPTURES_TAIL_RISK",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy", "scipy"],
+    },
+}
+
+# =====================================================================
+# Entry 10 — complexity 8: RLM environment — risk-parity rebalancing
+# =====================================================================
+
+CODE_RP = '''"""RLM TEACHING ENTRY: multi-asset portfolio rebalancing as ENVIRONMENT
+INTERACTION, with risk-parity optimization and constraint handling.
+
+The rebalancing workflow is exposed as a stateful environment with a
+gym-like reset/step API and a strict precondition chain:
+
+  reset -> compute_covariance -> optimize_weights -> apply_constraints
+        -> execute_rebalance -> evaluate_performance
+
+Two actions in the scripted plan are deliberately out of order; guards
+refuse them with error observations (never exceptions) and the driver
+recovers by re-ordering. Constraint handling uses iterative waterfall
+capping — the naive cap-then-renormalize approach pushes capped weights
+back ABOVE the cap, a real bug this entry demonstrates the fix for.
+All observations are JSON-serializable dicts; deterministic replay is
+verified. Seeded and deterministic throughout.
+"""
+
+from __future__ import annotations
+
+import json
+
+import numpy as np
+from scipy.optimize import minimize
+
+RNG_SEED = 10
+N_ASSETS = 4
+N_DAYS = 1250
+N_TRAIN = 1000
+ANN = 252
+MAX_WEIGHT = 0.40
+COST_BPS = 5.0
+SHRINK = 0.10
+
+
+def simulate_returns(seed: int) -> np.ndarray:
+    """One common factor + heterogeneous idiosyncratic vols, so the
+    risk-parity solution differs visibly from equal weight."""
+    rng = np.random.default_rng(seed)
+    factor = rng.standard_normal(N_DAYS)
+    betas = np.array([1.2, 0.9, 0.5, 0.2])
+    idio_vol = np.array([0.25, 0.18, 0.12, 0.07]) / np.sqrt(ANN)
+    factor_vol = 0.10 / np.sqrt(ANN)
+    rets = (betas[None, :] * factor[:, None] * factor_vol
+            + idio_vol[None, :] * rng.standard_normal((N_DAYS, N_ASSETS)))
+    return rets + 0.03 / ANN
+
+
+def waterfall_cap(w: np.ndarray, cap: float) -> np.ndarray:
+    """Iteratively cap weights and redistribute to uncapped assets.
+
+    Naive min(w, cap)/sum violates the cap after renormalization; the
+    waterfall repeats until no violation remains. Terminates because
+    N_ASSETS * cap > 1."""
+    w = w.copy()
+    for _ in range(N_ASSETS):          # at most N iterations by construction
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        excess = float((w[over] - cap).sum())
+        w[over] = cap
+        free = ~over
+        w[free] += excess * w[free] / w[free].sum()
+    return w
+
+
+class QuantEnvironment:
+    """Stateful portfolio-rebalancing environment.
+
+    Guards return {"ok": False, "error": ...} observations for invalid
+    orderings — the agent must read observations and re-plan, not crash.
+    """
+
+    ACTIONS = ("reset", "compute_covariance", "optimize_weights",
+               "apply_constraints", "execute_rebalance", "evaluate_performance")
+
+    def __init__(self, seed: int = RNG_SEED):
+        self._seed = seed
+        self._state = "uninitialized"
+        self._rets = None
+        self._cov = None
+        self._w_opt = None
+        self._w_final = None
+        self._prev_w = None
+        self._cost = None
+
+    def reset(self) -> dict:
+        self._rets = simulate_returns(self._seed)
+        self._cov = None
+        self._w_opt = None
+        self._w_final = None
+        self._prev_w = np.full(N_ASSETS, 1.0 / N_ASSETS)   # incumbent book
+        self._cost = None
+        self._state = "reset"
+        return {"ok": True, "state": self._state, "n_assets": N_ASSETS,
+                "n_train": N_TRAIN, "n_eval": N_DAYS - N_TRAIN,
+                "incumbent_weights": [round(float(x), 4) for x in self._prev_w]}
+
+    def step(self, action: dict) -> dict:
+        name = action.get("name")
+        if name not in self.ACTIONS:
+            return {"ok": False, "error": f"unknown action: {name}",
+                    "state": self._state}
+        if name == "reset":
+            return self.reset()
+        if self._state == "uninitialized":
+            return {"ok": False, "error": "call reset first", "state": self._state}
+        return getattr(self, f"_do_{name}")(action)
+
+    def _do_compute_covariance(self, action: dict) -> dict:
+        train = self._rets[:N_TRAIN]                  # train window only
+        sample = np.cov(train, rowvar=False, ddof=1)
+        target = np.diag(np.diag(sample))
+        self._cov = (1.0 - SHRINK) * sample + SHRINK * target
+        self._state = "covariance_ready"
+        return {"ok": True, "state": self._state, "shrinkage": SHRINK,
+                "ann_vols": [round(float(v), 4)
+                             for v in np.sqrt(np.diag(self._cov) * ANN)],
+                "condition_number": round(float(np.linalg.cond(self._cov)), 1)}
+
+    def _do_optimize_weights(self, action: dict) -> dict:
+        if self._cov is None:
+            return {"ok": False, "error": "compute_covariance before optimize_weights",
+                    "state": self._state}
+        cov = self._cov
+
+        def rc_dispersion(w):
+            port_var = w @ cov @ w
+            rc = w * (cov @ w) / port_var
+            return float(((rc - 1.0 / N_ASSETS) ** 2).sum())
+
+        res = minimize(rc_dispersion, np.full(N_ASSETS, 1.0 / N_ASSETS),
+                       method="SLSQP", bounds=[(1e-4, 1.0)] * N_ASSETS,
+                       constraints=[{"type": "eq",
+                                     "fun": lambda w: w.sum() - 1.0}],
+                       options={"ftol": 1e-14, "maxiter": 500})
+        self._w_opt = res.x / res.x.sum()
+        rc = self._w_opt * (cov @ self._w_opt) / (self._w_opt @ cov @ self._w_opt)
+        self._state = "optimized"
+        return {"ok": True, "state": self._state, "converged": bool(res.success),
+                "weights": [round(float(x), 4) for x in self._w_opt],
+                "risk_contributions": [round(float(x), 4) for x in rc],
+                "rc_dispersion": float(f"{rc_dispersion(self._w_opt):.2e}")}
+
+    def _do_apply_constraints(self, action: dict) -> dict:
+        if self._w_opt is None:
+            return {"ok": False, "error": "optimize_weights before apply_constraints",
+                    "state": self._state}
+        w = waterfall_cap(self._w_opt, MAX_WEIGHT)
+        self._w_final = w
+        self._state = "constrained"
+        return {"ok": True, "state": self._state, "max_weight_cap": MAX_WEIGHT,
+                "n_capped": int((self._w_opt > MAX_WEIGHT).sum()),
+                "weights": [round(float(x), 4) for x in w],
+                "sum_weights": round(float(w.sum()), 6),
+                "cap_respected": bool((w <= MAX_WEIGHT + 1e-9).all())}
+
+    def _do_execute_rebalance(self, action: dict) -> dict:
+        if self._w_final is None:
+            return {"ok": False, "error": "apply_constraints before execute_rebalance",
+                    "state": self._state}
+        turnover = float(np.abs(self._w_final - self._prev_w).sum())
+        self._cost = turnover * COST_BPS / 1e4
+        self._state = "rebalanced"
+        return {"ok": True, "state": self._state, "turnover": round(turnover, 4),
+                "cost_bps_paid": round(self._cost * 1e4, 3)}
+
+    def _do_evaluate_performance(self, action: dict) -> dict:
+        if self._cost is None:
+            return {"ok": False, "error": "execute_rebalance before evaluate_performance",
+                    "state": self._state}
+        oos = self._rets[N_TRAIN:]                    # sealed evaluation window
+        port = oos @ self._w_final
+        port[0] -= self._cost
+        sd = port.std(ddof=1)
+        eq = oos @ np.full(N_ASSETS, 1.0 / N_ASSETS)
+        self._state = "evaluated"
+        return {"ok": True, "state": self._state,
+                "oos_ann_vol": round(float(sd * np.sqrt(ANN)), 4),
+                "oos_sharpe_net": round(0.0 if sd == 0
+                                        else float(port.mean() / sd * np.sqrt(ANN)), 3),
+                "equal_weight_ann_vol": round(float(eq.std(ddof=1) * np.sqrt(ANN)), 4)}
+
+
+def main() -> None:
+    env = QuantEnvironment(seed=RNG_SEED)
+    # Scripted plan with TWO deliberate ordering mistakes.
+    plan = [
+        {"name": "optimize_weights"},      # invalid: environment not reset
+        {"name": "reset"},
+        {"name": "compute_covariance"},
+        {"name": "optimize_weights"},
+        {"name": "execute_rebalance"},     # invalid: constraints not applied
+        {"name": "apply_constraints"},
+        {"name": "execute_rebalance"},
+        {"name": "evaluate_performance"},
+    ]
+    executed, guard_failures = [], 0
+    obs = None
+    final_by_action = {}
+    for action in plan:
+        obs = env.step(action)
+        print(f"trace={json.dumps({'action': action['name'], 'observation': obs}, sort_keys=True)}")
+        if obs["ok"]:
+            executed.append(action["name"])
+            final_by_action[action["name"]] = obs
+        else:
+            guard_failures += 1
+
+    constrained = final_by_action["apply_constraints"]
+    evaluated = final_by_action["evaluate_performance"]
+    checks = {
+        "guards_rejected_both_unordered_actions": guard_failures == 2,
+        "recovered_full_action_sequence": executed == list(QuantEnvironment.ACTIONS),
+        "final_observation_json_roundtrip": json.loads(json.dumps(obs)) == obs,
+        "weights_sum_to_one": abs(constrained["sum_weights"] - 1.0) < 1e-6,
+        "weight_cap_respected": constrained["cap_respected"],
+        "risk_parity_achieved": final_by_action["optimize_weights"]["rc_dispersion"] < 1e-8,
+        "rp_vol_below_equal_weight": evaluated["oos_ann_vol"] < evaluated["equal_weight_ann_vol"],
+    }
+    env2 = QuantEnvironment(seed=RNG_SEED)
+    obs2 = None
+    for action in plan:
+        obs2 = env2.step(action)
+    checks["deterministic_replay"] = obs == obs2
+
+    print("RESULTS")
+    print("environment_class=QuantEnvironment")
+    print(f"actions_executed={','.join(executed)}")
+    print(f"guard_failures_handled={guard_failures}")
+    for name, passed in checks.items():
+        print(f"check_{name}={passed}")
+    print(f"final_observation={json.dumps(obs, sort_keys=True)}")
+    verdict = "ENVIRONMENT_VERIFIED" if all(checks.values()) else "ENVIRONMENT_BROKEN"
+    print(f"verdict={verdict}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_RP = {
+    "schema_version": 2,
+    "entry_kind": "rlm_environment",
+    "expected_verdict": "ENVIRONMENT_VERIFIED",
+    "flaws": [],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [
+            {
+                "function": "waterfall_cap",
+                "reason": "iterative constraint projection: each capping round depends on the previous redistribution; bounded by N_ASSETS",
+                "max_iterations": 4,
+            },
+            {
+                "function": "main",
+                "reason": "agent action loop: each step depends on the previous observation",
+                "max_iterations": 8,
+            },
+        ],
+    },
+    "rlm": {
+        "environment_class": "QuantEnvironment",
+        "actions": [
+            "reset",
+            "compute_covariance",
+            "optimize_weights",
+            "apply_constraints",
+            "execute_rebalance",
+            "evaluate_performance",
+        ],
+        "max_recursion_depth": 3,
+        "tool_timeout_seconds": 120,
+    },
+    "training_sequence": {
+        "style": "environment_interaction",
+        "include_adversarial_critique": True,
+        "include_final_calibrated_answer": True,
+        "loss_masking": {
+            "user": 0.0,
+            "environment_observation": 0.0,
+            "assistant_thought": 1.0,
+            "tool_call": 1.0,
+            "final_answer": 1.0,
+        },
+    },
+    "metadata": {
+        "id": "qlm1-000010-rlm-portfolio-rebalance",
+        "domain": "Portfolio Construction / Environment Interaction",
+        "complexity": 8,
+        "tags": [
+            "rlm",
+            "environment",
+            "risk-parity",
+            "covariance-shrinkage",
+            "slsqp",
+            "waterfall-capping",
+            "turnover-costs",
+            "error-recovery",
+            "deterministic-replay",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "The task is not 'compute risk-parity weights' but 'conduct the rebalancing "
+            "THROUGH an environment' whose precondition chain encodes the methodology: "
+            "estimating covariance before optimizing, optimizing before constraining, "
+            "constraining before trading, trading before evaluating. Skipping any link is "
+            "a research error the environment must refuse with an error observation, and "
+            "the plan's two deliberate ordering mistakes exist to train exactly that "
+            "refusal-and-recovery loop. A second lesson rides along: constraint "
+            "projection is nontrivial — the obvious cap-then-renormalize is WRONG "
+            "(renormalization pushes capped weights back over the cap), and the "
+            "environment's cap_respected observation exposes whether the waterfall fix "
+            "actually holds."
+        ),
+        "tool_selection": (
+            "Python REPL hosting the environment; numpy for the factor-model simulation "
+            "and covariance algebra, scipy SLSQP for the risk-contribution-dispersion "
+            "minimization, json for the observation protocol — every observation must "
+            "survive a json round-trip because RLM agents consume serialized tool "
+            "output, never live objects."
+        ),
+        "recursive_delegation": (
+            "Depth 3 covers parent -> rebalancing sub-agent -> verification sub-agent "
+            "replaying the trace against a fresh same-seed environment. The parent owns "
+            "the plan; the sub-agent drives actions and must surface, not suppress, "
+            "error observations; the verifier's replay check is performed inline here "
+            "as the deterministic_replay invariant."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "Environment-level hypotheses — H0-env: the environment is NOT a faithful "
+            "instrument (permits invalid orderings, emits non-serializable observations, "
+            "violates the weight cap or budget constraint, fails risk parity, or replays "
+            "non-deterministically). H1-env: all eight checks hold — both unordered "
+            "actions rejected, full sequence recovered, json round-trip, weights sum to "
+            "1, cap respected after waterfall projection, risk-contribution dispersion "
+            "< 1e-8 on the optimized weights, OOS risk-parity vol below equal-weight "
+            "vol, and exact deterministic replay. Verdict ENVIRONMENT_VERIFIED is the "
+            "conjunction; any failure yields ENVIRONMENT_BROKEN."
+        ),
+        "data_engineering": (
+            "Returns are generated INSIDE the environment on reset(): 4 assets x 1250 "
+            "days from a one-factor model with betas (1.2, 0.9, 0.5, 0.2) and "
+            "heterogeneous idiosyncratic vols (25%-7%), so the risk-parity solution is "
+            "visibly far from equal weight and the 0.40 cap binds on the low-vol asset "
+            "— making the constraint path non-trivial by construction. The 1000/250 "
+            "train/eval split is fixed by the environment, not the agent, so no action "
+            "can leak evaluation data into estimation. Covariance uses 10% shrinkage "
+            "toward the diagonal — the minimal regularization gesture, with the "
+            "condition number exposed in the observation."
+        ),
+        "methodology_justification": (
+            "Risk parity via minimizing the dispersion of risk contributions RC_i = "
+            "w_i (Σw)_i / (w'Σw) around 1/N is the standard formulation; SLSQP with a "
+            "budget equality and positivity bounds solves the 4-asset problem to "
+            "machine-level dispersion. Waterfall capping is chosen over naive "
+            "cap-and-renormalize deliberately: the naive method returned a 0.4386 "
+            "weight against a 0.40 cap during development — the environment now "
+            "reports cap_respected so the defect class is machine-checked forever. "
+            "Guards return error observations rather than raising because observation-"
+            "driven re-planning, not crash handling, is the trainable RLM behavior. "
+            "Costs are charged on turnover from the incumbent equal-weight book, so "
+            "execute_rebalance has real economic content."
+        ),
+        "code_implementation": CODE_RP,
+        "statistical_validation": (
+            "Eight machine-checked invariants printed as check_* lines, including: "
+            "risk-contribution dispersion < 1e-8 (achieved: ~5e-16, i.e. exact risk "
+            "parity on the training covariance); cap respected after waterfall "
+            "(naive renormalization provably violates it on this instance); OOS "
+            "risk-parity vol (~8.7%) below equal-weight vol (~11.5%) — the economic "
+            "point of risk parity realized out of sample; and exact deterministic "
+            "replay of the final observation from a fresh same-seed environment. The "
+            "guard tests are calibrated: exactly two invalid actions are planned and "
+            "exactly two must be refused."
+        ),
+        "risk_and_backtest_audit": (
+            "Environment-integrity risks: (a) state leakage — an environment that let "
+            "evaluate_performance run before execute_rebalance would score a costless "
+            "paper portfolio; the precondition chain plus guard test closes this; "
+            "(b) constraint laundering — reporting capped weights while internally "
+            "trading uncapped ones; cap_respected is computed from the weights actually "
+            "used downstream; (c) nondeterminism — fresh randomness per reset would "
+            "make RLM trajectories unreproducible; the replay check enforces bit-level "
+            "stability. Financial caveats surfaced in observations: single-window "
+            "covariance estimation, one rebalance (no multi-period turnover path), and "
+            "5 bps linear costs are simplifications the evaluation observation makes "
+            "no attempt to hide."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) The naive cap-then-renormalize bug is the seductive trap for the "
+            "student: it looks correct, sums to 1, and silently violates the cap — "
+            "only the cap_respected check catches it. (2) A plan without deliberate "
+            "mistakes would pass while demonstrating nothing about recovery; the "
+            "mistakes are load-bearing. (3) SLSQP convergence is reported but not "
+            "guaranteed for larger N or near-singular covariances — at scale, switch "
+            "to the cyclical coordinate descent risk-parity algorithm with proven "
+            "convergence. (4) Rounding observations to 4 decimals is required for "
+            "replay comparison but could mask small nondeterminism; keep rounding no "
+            "coarser. (5) Equal risk contribution on the TRAINING covariance does not "
+            "guarantee equal realized OOS contributions — the evaluation observation "
+            "reports vol, not a false claim of realized parity."
+        ),
+        "falsification_strategy": (
+            "Break the environment and confirm the battery catches it: (a) replace "
+            "waterfall_cap with naive cap-and-renormalize — cap_respected fails and "
+            "the verdict flips to ENVIRONMENT_BROKEN; (b) remove the execute_rebalance "
+            "guard — the guard-count check fails; (c) inject fresh randomness per "
+            "reset — deterministic_replay fails; (d) swap the factor model for equal "
+            "vols — risk parity converges to equal weight and the rp_vol_below_equal_"
+            "weight check correctly FAILS, proving the battery rejects environments "
+            "where the optimization is vacuous."
+        ),
+        "limitations": (
+            "One scripted plan exercises one recovery path; full RLM coverage needs "
+            "many plans (shuffled orders, repeated actions, unknown actions) over this "
+            "environment. Single rebalance date: multi-period paths with turnover "
+            "budgets and drift-triggered rebalancing are the natural extension. The "
+            "covariance is estimated once; rolling re-estimation with the attendant "
+            "estimation-noise-vs-turnover tradeoff is out of scope. Long-only unit-"
+            "leverage risk parity only — levered risk parity introduces financing "
+            "costs and a different risk profile entirely."
+        ),
+    },
+    "agent_instructions": (
+        "1. Instantiate QuantEnvironment with the fixed seed; never generate data "
+        "outside it. 2. Drive actions exclusively via env.step({'name': ...}); after "
+        "each step branch on obs['ok'] — on False, read obs['error'] and re-order the "
+        "plan to satisfy the stated precondition, never retry blindly. 3. Complete the "
+        "chain: reset, compute_covariance, optimize_weights, apply_constraints, "
+        "execute_rebalance, evaluate_performance. 4. Log every (action, observation) "
+        "pair as a json trace line. 5. Run the verification battery: guard counts, "
+        "sequence recovery, json round-trip, budget and cap invariants, risk-parity "
+        "dispersion < 1e-8, OOS vol comparison, deterministic replay. 6. Emit "
+        "verdict=ENVIRONMENT_VERIFIED only if every check passes; otherwise name the "
+        "failing check in ENVIRONMENT_BROKEN. 7. Report the OOS numbers exactly as "
+        "observed — the wrapper never editorializes the underlying result."
+    ),
+    "verification": {
+        "timeout_seconds": 120,
+        "must_print": [
+            "RESULTS",
+            "environment_class=QuantEnvironment",
+            "actions_executed=reset,compute_covariance,optimize_weights,apply_constraints,execute_rebalance,evaluate_performance",
+            "guard_failures_handled=2",
+            "check_weight_cap_respected=True",
+            "check_risk_parity_achieved=True",
+            "check_deterministic_replay=True",
+            "final_observation=",
+            "verdict=ENVIRONMENT_VERIFIED",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy", "scipy"],
+    },
+}
+
+# =====================================================================
+# Entry 11 — complexity 8: limit order book microstructure (v2-native)
+# =====================================================================
+
+CODE_LOB = '''"""Limit order book dynamics: bid-ask spread vs order-flow imbalance,
+queue position for a resting limit order, and adverse-selection cost.
+
+Model: best-quote-level LOB with Poisson-thinned event types (market
+orders, limit joins, inside-quote improvements, cancels) and MARKOV-
+PERSISTENT market-order direction (rho=0.75) — persistence is essential:
+with IID flow, resting-order fills carry no information and adverse
+selection vanishes (verified during development). Three measurements:
+(1) mean spread as a function of |OFI| terciles + OLS slope;
+(2) fill probability for a tagged order joining the back of the bid
+queue, with correct front-of-queue mechanics (the order becomes the
+level when everyone ahead leaves — it is NOT canceled);
+(3) adverse selection via markouts: mid at fill+H versus fill price,
+compared against the unconditional immediate-fill counterfactual.
+numpy only; deterministic (seeded).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+RNG_SEED = 11
+N_EVENTS = 60000
+TICK = 0.01
+MID0 = 100.00
+P_MKT = 0.15           # market order prob per event (each side via direction)
+P_LIMIT = 0.20         # limit join prob per side
+P_CANCEL = 0.15        # cancel prob per side
+DEPTH_MEAN = 6.0       # mean refill depth after a level breaks
+GAP2_PROB = 0.35       # prob the refreshed best sits 2 ticks away
+RHO = 0.75             # market-order direction persistence
+N_TAGGED = 2000
+EP_EVENTS = 600
+HORIZON = 40
+
+
+class LOB:
+    """Best-quote-level order book. The event loop is inherently
+    sequential: every event conditions on current book state."""
+
+    def __init__(self, rng: np.random.Generator):
+        self.rng = rng
+        self.bid, self.ask = MID0 - TICK / 2, MID0 + TICK / 2
+        self.Qb, self.Qa = 8, 8
+        self.last_dir = -1 if rng.random() < 0.5 else 1
+
+    def mid(self) -> float:
+        return (self.bid + self.ask) / 2
+
+    def spread_ticks(self) -> int:
+        return round((self.ask - self.bid) / TICK)
+
+    def ofi(self) -> float:
+        return (self.Qb - self.Qa) / (self.Qb + self.Qa)
+
+    def refill(self) -> int:
+        return 1 + int(-DEPTH_MEAN * np.log(max(self.rng.random(), 1e-12)))
+
+    def step(self) -> str:
+        x = self.rng.random()
+        if x < 2 * P_MKT:
+            if self.rng.random() >= RHO:
+                self.last_dir = -self.last_dir
+            if self.last_dir == -1:            # market sell hits the bid
+                self.Qb -= 1
+                if self.Qb <= 0:
+                    gap = 2 if self.rng.random() < GAP2_PROB else 1
+                    self.bid -= gap * TICK
+                    self.Qb = self.refill()
+                    return "sell_break"
+                return "sell"
+            self.Qa -= 1                       # market buy lifts the ask
+            if self.Qa <= 0:
+                gap = 2 if self.rng.random() < GAP2_PROB else 1
+                self.ask += gap * TICK
+                self.Qa = self.refill()
+                return "buy_break"
+            return "buy"
+        if x < 2 * P_MKT + P_LIMIT:            # bid-side limit order
+            if self.spread_ticks() > 1 and self.rng.random() < 0.5:
+                self.bid += TICK               # improve inside the spread
+                self.Qb = 1 + int(self.rng.random() * 4)
+                return "jb_inside"
+            self.Qb += 1
+            return "jb"
+        if x < 2 * P_MKT + 2 * P_LIMIT:        # ask-side limit order
+            if self.spread_ticks() > 1 and self.rng.random() < 0.5:
+                self.ask -= TICK
+                self.Qa = 1 + int(self.rng.random() * 4)
+                return "ja_inside"
+            self.Qa += 1
+            return "ja"
+        if x < 2 * P_MKT + 2 * P_LIMIT + P_CANCEL:
+            if self.Qb > 1:
+                self.Qb -= 1
+            return "cb"
+        if self.Qa > 1:
+            self.Qa -= 1
+        return "ca"
+
+
+def spread_vs_ofi(seed: int) -> tuple:
+    """Long-path measurement of spread conditional on |OFI|."""
+    rng = np.random.default_rng(seed)
+    lob = LOB(rng)
+    spread = np.empty(N_EVENTS)
+    ofi = np.empty(N_EVENTS)
+    mids = np.empty(N_EVENTS)
+    for t in range(N_EVENTS):
+        spread[t] = lob.spread_ticks()
+        ofi[t] = lob.ofi()
+        mids[t] = lob.mid()
+        lob.step()
+    a = np.abs(ofi)
+    e1, e2 = np.quantile(a, [1 / 3, 2 / 3])
+    terciles = (float(spread[a <= e1].mean()),
+                float(spread[(a > e1) & (a <= e2)].mean()),
+                float(spread[a > e2].mean()))
+    slope = float(np.polyfit(a, spread, 1)[0])
+    return terciles, slope, mids, spread
+
+
+def tagged_order_study(seed: int) -> dict:
+    """Episodes: a tagged order joins the back of the bid queue at t=0.
+
+    Front-of-queue mechanics: market sells consume the units AHEAD first;
+    when ahead==0 the next market sell fills US (the level cannot break
+    past a resting order). Cancels remove ahead-units with probability
+    ahead/(ahead+behind). Inside-quote improvements strand the order
+    (treated as unfilled). Markout = mid(fill+H) - fill_price; benchmark
+    is the immediate-fill counterfactual mid(H) - bid(0) over ALL
+    episodes, so both legs share the same dynamics.
+    """
+    rng = np.random.default_rng(seed)
+    fills = 0
+    adverse = 0
+    markouts = []
+    uncond_markouts = []
+    uncond_down = 0
+    for _ in range(N_TAGGED):
+        lob = LOB(rng)
+        bid0 = lob.bid
+        ahead, behind = lob.Qb, 0
+        fill_price, fill_t = None, None
+        path = []
+        alive = True
+        for t in range(EP_EVENTS):
+            path.append(lob.mid())
+            if fill_price is not None and t >= fill_t + HORIZON:
+                break
+            if alive and fill_price is None:
+                b0 = lob.bid
+                ev = lob.step()
+                if ev in ("sell", "sell_break"):
+                    if ahead > 0:
+                        ahead -= 1
+                        if ev == "sell_break":
+                            alive = False      # book/tag inconsistency: stale
+                    else:
+                        fill_price = b0        # front of queue: we are filled
+                        fill_t = t + 1
+                elif ev == "jb":
+                    behind += 1
+                elif ev == "jb_inside":
+                    alive = False              # price improved past our level
+                elif ev == "cb":
+                    tot = ahead + behind
+                    if tot > 0 and rng.random() < ahead / tot:
+                        ahead = max(ahead - 1, 0)
+                    else:
+                        behind = max(behind - 1, 0)
+            else:
+                lob.step()
+        h_end = min(HORIZON, len(path) - 1)
+        uncond_markouts.append(path[h_end] - bid0)
+        if path[h_end] < bid0:
+            uncond_down += 1
+        if fill_price is not None:
+            idx = min(fill_t + HORIZON, len(path) - 1)
+            mo = path[idx] - fill_price
+            markouts.append(mo)
+            fills += 1
+            if mo < 0:
+                adverse += 1
+    return {
+        "fill_prob": fills / N_TAGGED,
+        "filled_markout_ticks": float(np.mean(markouts)) / TICK,
+        "uncond_markout_ticks": float(np.mean(uncond_markouts)) / TICK,
+        "adverse_prob": adverse / max(fills, 1),
+        "uncond_down_prob": uncond_down / N_TAGGED,
+    }
+
+
+def main() -> None:
+    terciles, slope, mids, spread = spread_vs_ofi(RNG_SEED)
+    study = tagged_order_study(RNG_SEED + 1)
+
+    checks = {
+        "spread_increases_with_ofi": terciles[0] < terciles[2] and slope > 0.0,
+        "fill_prob_interior": 0.05 < study["fill_prob"] < 0.99,
+        "fills_adversely_selected":
+            study["filled_markout_ticks"] < study["uncond_markout_ticks"],
+        "adverse_prob_exceeds_unconditional":
+            study["adverse_prob"] > study["uncond_down_prob"],
+        "mid_moves_exist": float(np.std(mids)) > 0.0,
+    }
+
+    print("RESULTS")
+    print(f"n_events={N_EVENTS}")
+    print(f"spread_ticks_low_ofi={terciles[0]:.3f}")
+    print(f"spread_ticks_mid_ofi={terciles[1]:.3f}")
+    print(f"spread_ticks_high_ofi={terciles[2]:.3f}")
+    print(f"spread_ofi_ols_slope={slope:.3f}")
+    print(f"fill_prob={study['fill_prob']:.3f}")
+    print(f"filled_markout_ticks={study['filled_markout_ticks']:.3f}")
+    print(f"uncond_markout_ticks={study['uncond_markout_ticks']:.3f}")
+    print(f"adverse_selection_cost_ticks="
+          f"{study['uncond_markout_ticks'] - study['filled_markout_ticks']:.3f}")
+    print(f"adverse_prob_given_fill={study['adverse_prob']:.3f}")
+    print(f"uncond_down_prob={study['uncond_down_prob']:.3f}")
+    for name, passed in checks.items():
+        print(f"check_{name}={passed}")
+    ok = all(checks.values())
+    print(f"verdict={'MICROSTRUCTURE_MODEL_VALIDATED' if ok else 'MODEL_CHECKS_FAILED'}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_LOB = {
+    "schema_version": 2,
+    "entry_kind": "correct",
+    "expected_verdict": "MICROSTRUCTURE_MODEL_VALIDATED",
+    "flaws": [],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [
+            {
+                "function": "spread_vs_ofi",
+                "reason": "event-driven LOB simulation: every event conditions on current book state; inherently sequential",
+                "max_iterations": 60000,
+            },
+            {
+                "function": "tagged_order_study",
+                "reason": "episode loop (2000) x event loop (600): queue position and fill state are path-dependent",
+                "max_iterations": 1200000,
+            },
+        ],
+    },
+    "rlm": MINIMAL_RLM,
+    "training_sequence": MINIMAL_TRAINING_SEQUENCE,
+    "metadata": {
+        "id": "qlm1-000011-microstructure-lob",
+        "domain": "Market Microstructure / Limit Order Books",
+        "complexity": 8,
+        "tags": [
+            "limit-order-book",
+            "order-flow-imbalance",
+            "queue-position",
+            "adverse-selection",
+            "markout",
+            "poisson-arrivals",
+            "flow-persistence",
+            "event-driven-simulation",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "Three microstructure claims must each be made falsifiable: (1) spreads widen "
+            "when the book is imbalanced — measured as mean spread by |OFI| tercile plus "
+            "an OLS slope, both of which must be positive; (2) a resting order's fill "
+            "probability is governed by queue mechanics — requiring correct front-of-"
+            "queue bookkeeping, since the naive implementation that cancels the order "
+            "when the queue ahead empties deletes exactly the paths where fills happen; "
+            "(3) fills are adversely selected — which is NOT automatic: with IID order "
+            "flow, fills carry no information and the markout gap vanishes (verified "
+            "during development), so Markov-persistent flow direction is a structural "
+            "requirement of the model, not decoration."
+        ),
+        "tool_selection": (
+            "Python REPL with numpy only, per the constraint. The event loop is a "
+            "deliberate exception to vectorization: LOB state transitions are inherently "
+            "sequential, declared in static_checks with iteration bounds. Measurement "
+            "layers (terciles, OLS slope, markout means) are vectorized numpy."
+        ),
+        "recursive_delegation": (
+            "The 2000 tagged-order episodes are independent given separate RNG streams "
+            "and shard naturally to sub-agents; the parent must own the benchmark "
+            "definition (immediate-fill counterfactual) so conditional and unconditional "
+            "markouts are computed under identical dynamics — a benchmark mismatch "
+            "across shards would silently manufacture or destroy the adverse-selection "
+            "finding."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "H0 (all must hold for MICROSTRUCTURE_MODEL_VALIDATED): (a) spread is "
+            "increasing in |OFI| (tercile monotonicity ends and positive OLS slope); "
+            "(b) tagged-order fill probability is interior (0.05, 0.99) — neither "
+            "degenerate certainty; (c) conditional-on-fill markout < unconditional "
+            "immediate-fill markout (fills earn less than the naive half-spread "
+            "expectation: adverse selection); (d) P(mid down at horizon | filled) > "
+            "P(mid down | unconditional); (e) the mid actually moves (non-degenerate "
+            "dynamics — the check that caught a dead parameterization during "
+            "development). Failure of any check yields MODEL_CHECKS_FAILED."
+        ),
+        "data_engineering": (
+            "No external data: the book IS the data-generating process. Event "
+            "probabilities (market 0.30, limit 0.40, cancel 0.30 across sides) are "
+            "balanced so queues deplete and prices move — an earlier draft with limit "
+            "arrivals dominating produced ever-growing queues, a frozen mid, and a "
+            "constant 1-tick spread, silently degenerating every downstream statistic; "
+            "the mid_moves_exist check now guards that failure class permanently. "
+            "Refill depth after a level break is geometric (mean 6); refreshed bests "
+            "sit 2 ticks away with prob 0.35, generating the spread variation that the "
+            "OFI regression explains."
+        ),
+        "methodology_justification": (
+            "A best-quote-level model (prices, queue sizes, persistent flow) is the "
+            "minimal structure that produces all three phenomena; full depth-ladder "
+            "simulation would add realism but no additional lesson at this complexity. "
+            "Markov flow persistence (rho=0.75) implements the empirical fact that "
+            "market-order signs are strongly autocorrelated, and is the causal "
+            "ingredient of adverse selection here — fills cluster in sell runs that "
+            "continue. Adverse selection is measured by markouts (the industry-standard "
+            "execution diagnostic) against an immediate-fill counterfactual from the "
+            "SAME episode ensemble, so the comparison isolates conditioning-on-fill "
+            "rather than differing dynamics. Queue-position mechanics follow "
+            "price-time priority: sells consume ahead-units first, cancels thin the "
+            "ahead-count proportionally, and a resting order becomes the level when "
+            "alone — it cannot be broken past."
+        ),
+        "code_implementation": CODE_LOB,
+        "statistical_validation": (
+            "Deterministic values at seed 11: spread terciles ~1.86/1.93/2.05 ticks "
+            "with OLS slope ~0.29 (spread widens with imbalance); fill_prob ~0.79; "
+            "filled markout ~+0.30 ticks vs unconditional ~+0.48 ticks — an adverse-"
+            "selection cost of ~0.18 ticks, with P(down|fill) ~0.34 vs "
+            "unconditional ~0.14. Dose-response probes for the student: set RHO=0.5 "
+            "(IID flow) and confirm the adverse-selection checks FAIL — the model "
+            "correctly predicts no adverse selection without informed/persistent flow; "
+            "raise RHO to 0.9 and confirm the markout gap widens monotonically."
+        ),
+        "risk_and_backtest_audit": (
+            "For a market-making or execution strategy built on this model, the audit "
+            "targets are: (a) the half-spread earned by passive fills is NOT the "
+            "realized edge — subtract the markout-measured adverse-selection cost, "
+            "which here consumes a large fraction of the half-spread; (b) queue-"
+            "position value decays nonlinearly — back-of-queue fills concentrate in "
+            "toxic sell runs, so fill quantity and fill quality anticorrelate; "
+            "(c) simulation-to-market gaps: real books have hidden liquidity, "
+            "cross-venue queues, and latency races the model omits, so any parameter "
+            "fitted here must be re-estimated on real messages before deployment; "
+            "(d) the episode design measures one order size (1 unit) — market impact "
+            "of larger orders is absent by construction."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) The naive tagged-order implementation (cancel when the queue ahead "
+            "empties) silently deletes the adverse-selection paths and reports "
+            "near-zero adverse selection with high confidence — the subtlest bug class: "
+            "wrong bookkeeping producing a plausible null. (2) Unbalanced event rates "
+            "freeze the book and degenerate every statistic to a constant; the "
+            "mid_moves_exist check exists because this happened. (3) Measuring "
+            "adverse selection against a benchmark from a DIFFERENT path or parameter "
+            "set manufactures spurious gaps. (4) With IID flow the model predicts no "
+            "adverse selection — a student who finds adverse selection under IID flow "
+            "has a bug, not a discovery. (5) OFI at the best level only is a noisy "
+            "proxy for book pressure; deeper-book imbalance measures behave "
+            "differently."
+        ),
+        "falsification_strategy": (
+            "(a) Set RHO=0.5 (IID flow): the fills_adversely_selected and adverse_prob "
+            "checks must fail while spread-OFI structure survives — cleanly separating "
+            "which phenomena need flow persistence. (b) Set GAP2_PROB=0 and inside-"
+            "improvement prob to 1.0 so the spread pins at 1 tick: the spread-OFI "
+            "checks must fail while fill mechanics survive. (c) Double DEPTH_MEAN and "
+            "confirm fill_prob falls (deeper refills mean longer queues ahead). "
+            "(d) Rerun across 10 seeds and confirm every check verdict is stable — "
+            "the checks are about structural properties, not seed luck."
+        ),
+        "limitations": (
+            "Best-quote-level abstraction: no depth ladder, hidden orders, icebergs, "
+            "or cross-venue fragmentation; queue-position estimates are exact only "
+            "under strict price-time priority with visible depth. Unit-size orders "
+            "throughout — no market impact or order-splitting. Event time, not "
+            "calendar time: intensities are stationary, so intraday seasonality "
+            "(open/close auctions, news bursts) is absent. Parameters are stylized, "
+            "not fitted to message data; all magnitudes (markouts, fill rates) are "
+            "model-relative, and only the qualitative structure transfers."
+        ),
+    },
+    "agent_instructions": (
+        "1. Run the long-path simulation; FIRST verify non-degeneracy (mid variance "
+        "> 0, spread not constant) before reading any statistic. 2. Measure spread "
+        "by |OFI| tercile and the OLS slope; require monotone ends and positive "
+        "slope. 3. Run the tagged-order episodes with front-of-queue mechanics: "
+        "sells consume ahead-units, the order becomes the level when alone, inside-"
+        "quote improvements strand it. 4. Compute fill probability and per-fill "
+        "markouts at the fixed horizon; compute the unconditional immediate-fill "
+        "benchmark from the SAME episode ensemble. 5. Assert the adverse-selection "
+        "ordering: filled markout < unconditional markout and P(down|fill) > "
+        "P(down). 6. Falsification battery: RHO=0.5 must kill adverse selection; "
+        "spread-pinning must kill the OFI relation; each check must fail exactly "
+        "when its mechanism is removed. 7. Emit MICROSTRUCTURE_MODEL_VALIDATED only "
+        "if all checks pass, and state the model-relative-magnitudes caveat."
+    ),
+    "verification": {
+        "timeout_seconds": 240,
+        "must_print": [
+            "RESULTS",
+            "spread_ofi_ols_slope=",
+            "fill_prob=",
+            "adverse_selection_cost_ticks=",
+            "check_spread_increases_with_ofi=True",
+            "check_fills_adversely_selected=True",
+            "check_adverse_prob_exceeds_unconditional=True",
+            "verdict=MICROSTRUCTURE_MODEL_VALIDATED",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy"],
+    },
+}
+
 ENTRIES = {
     "001_sma_crossover.json": migrate_v1_to_v2(
         ENTRY_SMA,
@@ -2228,6 +4064,11 @@ ENTRIES = {
     "004_adversarial_lookahead_sma.json": ENTRY_LOOKAHEAD,
     "005_adversarial_p_hacking_sweep.json": ENTRY_PHACK,
     "006_rlm_environment_garch.json": ENTRY_RLM,
+    "007_options_bsm_calibration.json": ENTRY_BSM,
+    "008_adv_survivorship_bias.json": ENTRY_SURV,
+    "009_risk_es_vs_var.json": ENTRY_ES,
+    "010_rlm_portfolio_rebalance.json": ENTRY_RP,
+    "011_microstructure_lob.json": ENTRY_LOB,
 }
 
 

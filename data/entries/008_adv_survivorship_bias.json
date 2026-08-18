@@ -1,0 +1,100 @@
+{
+  "schema_version": 2,
+  "entry_kind": "adversarial",
+  "expected_verdict": "REJECTED_SURVIVORSHIP_BIAS",
+  "flaws": [
+    {
+      "type": "survivorship_bias",
+      "severity": "fatal",
+      "location": "code_implementation:main (naive backtest universe construction)",
+      "description": "The naive backtest is run on the survivor-only universe with full clean histories: the 43 delisted assets (bubble stocks that hit their -80% jump-to-default) are silently absent, and the surviving bubble stocks' spectacular runs dominate the momentum ranking, inflating Sharpe from ~0.39 to ~1.74.",
+      "detection": "Re-run the identical strategy on the full universe with delisting returns applied on the delisting day and dead assets marked untradeable thereafter; a Sharpe drop above 0.5 convicts the universe construction. On real data: compare the backtest universe's asset count per year against a point-in-time constituent file — a universe whose membership never shrinks is survivor-conditioned by definition.",
+      "corrective_action": "Use point-in-time universe membership with delisting returns included (the standard CRSP-style treatment); apply the delisting-day return to any held position and remove the asset from the eligible set only afterwards. Report the audited number as the only honest estimate."
+    }
+  ],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "simulate_universe",
+        "reason": "per-asset delisting bookkeeping loop over 200 assets (not over time)",
+        "max_iterations": 200
+      },
+      {
+        "function": "momentum_backtest",
+        "reason": "portfolio state (weights, costs) carries across days; rebalancing is path-dependent",
+        "max_iterations": 1008
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "multi_turn_audit",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000008-adv-survivorship-bias",
+    "domain": "Equity Momentum / Backtest Auditing",
+    "complexity": 5,
+    "tags": [
+      "adversarial",
+      "survivorship-bias",
+      "momentum",
+      "delisting-returns",
+      "point-in-time-universe",
+      "jump-to-default",
+      "backtest-audit"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "A momentum backtest reports Sharpe ~1.7 on a 4-year equity panel. The auditor's first question for any cross-sectional equity result: WHERE did the universe come from, and can its membership shrink? A universe pulled from today's database contains only firms that survived to today — and momentum is maximally exposed to this bias because it deliberately buys the assets with the most spectacular trailing returns, which in the full universe are exactly the ones carrying blow-up risk. The audit plan: hold the strategy code fixed and ablate only the universe/return panel.",
+    "tool_selection": "Python REPL with numpy for the panel simulation and vectorized momentum ranking, pandas available for tabulation. The decisive tool is the controlled ablation: two runs of the identical backtest function differing only in (universe, return panel, eligibility mask).",
+    "recursive_delegation": "Single-agent scale here. In a production audit across many submitted backtests, delegate one sub-agent per backtest to run the standardized survivor-ablation, with the parent maintaining the point-in-time constituent reference data that individual agents must never reconstruct from a current snapshot — centralizing the one data source whose corruption causes this bias."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "Naive claim: long-only top-quintile 6m momentum earns Sharpe ~1.74 net of 10 bps costs. Audit hypotheses — H0: the result is robust to universe construction, i.e. Sharpe(survivor-only) - Sharpe(full universe with delistings) <= 0.5. H1: the gap exceeds 0.5, convicting survivorship bias. Ground truth favors H1 by construction: the simulated economy contains bubble assets whose 30%/yr drift is compensation for a daily 0.12% jump-to-default hazard — in the full panel their unconditional edge is roughly zero, and only survivor-conditioning makes them look like alpha.",
+    "data_engineering": "Panel: 200 assets x 1008 days, seeded. 140 sound assets (2%/yr drift, 28% vol) and 60 bubble assets (30%/yr drift, 35% vol, daily hazard 0.0012 of a terminal -80% crash then delisting; ~43 die over 4 years). Audited panel applies the crash return on the delisting day and zeros afterwards with an eligibility mask — mirroring correct CRSP-style delisting-return handling. The naive panel is the SAME simulation restricted to survivors with clean histories: precisely what querying a current-membership database produces.",
+    "methodology_justification": "The audit is a controlled ablation rather than a statistical test because the question is about data construction, not sampling error: one function, two (universe, panel) inputs, all strategy parameters frozen. The 0.5-Sharpe threshold encodes the economic prior that universe bookkeeping should be performance-neutral for an honest backtest. The bubble/hazard design is the key teaching choice: it puts the delistings at the TOP of the momentum ranking (torpedo risk), where they maximally damage the strategy — a survivorship trap that random low-drift delistings would understate.",
+    "code_implementation": "\"\"\"ADVERSARIAL TEACHING ENTRY: survivorship bias in equity momentum.\n\nPedagogical arc: plausible strategy -> attractive naive result ->\nadversarial audit -> flaw detected -> corrected conclusion.\n\nUniverse design makes the trap realistic: 140 'sound' assets (2%/yr\ndrift) plus 60 'bubble' assets (30%/yr drift, but a daily jump-to-default\nhazard: a terminal -80% crash followed by delisting). Momentum loads on\nexactly the assets that blow up. The NAIVE backtest is run on the\nsurvivor-only universe with full clean histories — the classic database\nmistake — and looks excellent. The AUDIT re-runs the identical strategy\non the full universe with delisting crashes included, and the Sharpe\ncollapses. Deterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nimport pandas as pd\n\nRNG_SEED = 18\nN_SOUND, N_BUBBLE = 140, 60\nN_DAYS = 1008              # 4 trading years\nANN_FACTOR = 252\nREBALANCE = 21             # monthly\nLOOKBACK = 126             # 6-month momentum\nTOP_Q = 0.2                # long top quintile\nBLOWUP_RET = -0.80         # terminal crash on delisting day\nHAZARD = 0.0012            # daily jump-to-default hazard (bubble assets)\nCOST_BPS = 10.0\nINFLATION_THRESHOLD = 0.5  # Sharpe gap that convicts the naive backtest\n\n\ndef simulate_universe(seed: int) -> tuple:\n    \"\"\"Full panel with ground-truth delistings.\n\n    Returns (clean_rets, audited_rets, alive, survivors): clean_rets is\n    the counterfactual no-delisting panel (what a survivor-only database\n    implicitly shows); audited_rets applies the -80% crash on the\n    delisting day and zeros (untradeable) afterwards.\n    \"\"\"\n    rng = np.random.default_rng(seed)\n    n = N_SOUND + N_BUBBLE\n    is_bubble = np.zeros(n, dtype=bool)\n    is_bubble[N_SOUND:] = True\n    drift = np.where(is_bubble, 0.30, 0.02) / ANN_FACTOR\n    vol = np.where(is_bubble, 0.35, 0.28) / np.sqrt(ANN_FACTOR)\n    rets = drift[None, :] + vol[None, :] * rng.standard_normal((N_DAYS, n))\n    hit = (rng.random((N_DAYS, n)) < HAZARD) & is_bubble[None, :]\n    delist_day = np.where(hit.any(axis=0), hit.argmax(axis=0), -1)\n    alive = np.ones((N_DAYS, n), dtype=bool)\n    audited = rets.copy()\n    for j in range(n):     # per-asset delisting bookkeeping (n=200, cheap)\n        d = delist_day[j]\n        if d >= 0:\n            audited[d, j] = BLOWUP_RET\n            audited[d + 1:, j] = 0.0\n            alive[d + 1:, j] = False\n    survivors = delist_day < 0\n    return rets, audited, alive, survivors\n\n\ndef momentum_backtest(rets: np.ndarray, eligible: np.ndarray,\n                      cost_bps: float) -> np.ndarray:\n    \"\"\"Monthly-rebalanced long-only top-quintile 6m momentum.\n\n    The strategy logic is IDENTICAL for naive and audited runs — only the\n    universe and return panel differ. That isolation is what makes the\n    audit an ablation of the data choice, not the strategy.\"\"\"\n    T, n = rets.shape\n    port = np.zeros(T)\n    weights = np.zeros(n)\n    cum = np.cumsum(rets, axis=0)\n    for t in range(LOOKBACK, T):    # sequential: positions carry state\n        if (t - LOOKBACK) % REBALANCE == 0:\n            mom = cum[t - 1] - cum[t - LOOKBACK - 1] if t - LOOKBACK - 1 >= 0                 else cum[t - 1]\n            elig = eligible[t]\n            mom_e = np.where(elig, mom, -np.inf)\n            k = max(int(elig.sum() * TOP_Q), 1)\n            top = np.argsort(mom_e)[-k:]\n            new_w = np.zeros(n)\n            new_w[top] = 1.0 / k\n            port[t] -= np.abs(new_w - weights).sum() * cost_bps / 1e4\n            weights = new_w\n        port[t] += (weights * rets[t]).sum()\n    return port[LOOKBACK:]\n\n\ndef annualized_sharpe(x: np.ndarray) -> float:\n    sd = x.std(ddof=1)\n    return 0.0 if sd == 0 else float(x.mean() / sd * np.sqrt(ANN_FACTOR))\n\n\ndef main() -> None:\n    rets, audited_rets, alive, survivors = simulate_universe(RNG_SEED)\n    n_total = N_SOUND + N_BUBBLE\n    n_surv = int(survivors.sum())\n\n    # --- The seductive naive backtest (flawed universe) --------------\n    naive_port = momentum_backtest(\n        rets[:, survivors],\n        np.ones((N_DAYS, n_surv), dtype=bool),   # everyone 'always tradeable'\n        COST_BPS,\n    )\n    naive_sharpe = annualized_sharpe(naive_port)\n    naive_ann_ret = float(naive_port.mean() * ANN_FACTOR)\n\n    # --- Adversarial audit: full universe, deaths included -----------\n    audited_port = momentum_backtest(audited_rets, alive, COST_BPS)\n    audited_sharpe = annualized_sharpe(audited_port)\n    audited_ann_ret = float(audited_port.mean() * ANN_FACTOR)\n\n    inflation = naive_sharpe - audited_sharpe\n    flawed = inflation > INFLATION_THRESHOLD\n    audit_verdict = \"REJECTED_SURVIVORSHIP_BIAS\" if flawed else \"NO_MATERIAL_SURVIVOR_EFFECT\"\n\n    print(\"RESULTS\")\n    print(f\"n_assets_total={n_total}\")\n    print(f\"n_survivors={n_surv}\")\n    print(f\"n_delisted={n_total - n_surv}\")\n    print(f\"naive_sharpe={naive_sharpe:.3f}\")\n    print(f\"naive_ann_return={naive_ann_ret:.4f}\")\n    print(f\"audited_sharpe={audited_sharpe:.3f}\")\n    print(f\"audited_ann_return={audited_ann_ret:.4f}\")\n    print(f\"sharpe_inflation={inflation:.3f}\")\n    print(f\"inflation_threshold={INFLATION_THRESHOLD}\")\n    print(\"flaw_type=SURVIVORSHIP_BIAS\")\n    print(f\"audit_verdict={audit_verdict}\")\n    print(f\"verdict={audit_verdict}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at seed 18: 157 survivors, 43 delisted; naive_sharpe ~1.74 vs audited_sharpe ~0.39, inflation ~1.35 >> 0.5 threshold; annualized return drops from ~9.3% to ~2.7%. Cross-seed behavior (8-48): naive exceeds audited in every seed with gaps of 0.4-1.5 — the bias is one-sided by construction, never a wash. Sanity invariants: the two runs share identical strategy code (verified by the single backtest function), survivor count + delisted count = 200, and the audited panel's delisting days each realize exactly one -80% return.",
+    "risk_and_backtest_audit": "Deploying the naive number means holding real bubble stocks at real hazard: expected blowups in the top-quintile portfolio are several per year, each costing weight x 80% — the audited Sharpe (~0.39) is the deployable estimate, and even it assumes delisting-day exits at the crash price rather than a halt/zero-recovery, so it remains optimistic. Frictions: 10 bps per-unit turnover is charged identically in both runs so costs cannot explain the gap. Institutional protocol: any equity backtest must ship with its universe-construction statement (point-in-time source, delisting-return treatment) before performance numbers are read."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The trap is seductive because the strategy code is genuinely honest — lagged signals, costs charged, no leakage; the corruption lives entirely in the data query, upstream of anything a code review inspects. (2) Partial fixes deceive: including dead assets' histories but omitting the delisting-day return (a common database gap) recovers only part of the damage and still inflates Sharpe. (3) The bias generalizes beyond delistings: backfilled histories of newly added index members create the same conditioning in reverse. (4) A mean-reversion strategy on the same corrupted universe would inflate even MORE (buying dips of stocks known to have recovered); momentum is not the worst case, just a realistic one.",
+    "falsification_strategy": "Attempt to rescue the naive result: (a) set HAZARD=0 so no assets die — the naive and audited runs must converge to identical numbers, confirming the harness itself adds no gap; (b) rerun with delisting crashes included but universe still survivor-only — the residual gap isolates the ranking-contamination channel from the crash-return channel; (c) sweep the hazard over {0.0005, 0.0012, 0.003} and verify the Sharpe gap grows monotonically with the death rate, as survivorship theory predicts.",
+    "limitations": "The simulation compresses survivorship into a single mechanism (jump-to-default on high-drift assets); real survivorship also flows through mergers, buyouts (which are often POSITIVE exits), and index reconstitution, so the real-world bias direction per exit type must be audited separately. The 0.5-Sharpe conviction threshold is calibrated for this panel size; smaller universes need a bootstrap on the gap. Long-only quintile momentum is one strategy; the bias magnitude is strategy-dependent and must be re-measured per strategy family."
+  },
+  "agent_instructions": "1. Reproduce the naive backtest exactly as submitted; record its Sharpe and universe size per rebalance date. 2. Interrogate the universe: does membership ever shrink? If not, presume survivor-conditioning and proceed to audit. 3. Rebuild the panel point-in-time: delisting returns applied on the delisting day, assets ineligible afterwards. 4. Re-run the IDENTICAL strategy function on the audited panel; compute the Sharpe gap. 5. If gap > 0.5: print flaw_type=SURVIVORSHIP_BIAS and verdict=REJECTED_SURVIVORSHIP_BIAS; report the audited number first. 6. Run the HAZARD=0 control to certify the harness adds no artificial gap. 7. In the final report, name the universe-construction statement as a mandatory artifact for every future equity backtest.",
+  "verification": {
+    "timeout_seconds": 240,
+    "must_print": [
+      "RESULTS",
+      "n_assets_total=200",
+      "naive_sharpe=",
+      "audited_sharpe=",
+      "sharpe_inflation=",
+      "flaw_type=SURVIVORSHIP_BIAS",
+      "audit_verdict=REJECTED_SURVIVORSHIP_BIAS",
+      "verdict=REJECTED_SURVIVORSHIP_BIAS"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "pandas"
+    ]
+  }
+}
