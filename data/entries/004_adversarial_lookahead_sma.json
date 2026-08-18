@@ -1,0 +1,87 @@
+{
+  "schema_version": 2,
+  "entry_kind": "adversarial",
+  "expected_verdict": "REJECTED_LOOKAHEAD_BIAS",
+  "flaws": [
+    {
+      "type": "lookahead_bias",
+      "severity": "fatal",
+      "location": "code_implementation:backtest (lag=0 branch, naive position construction)",
+      "description": "The strategy trades on the same bar whose close generated the signal: position_t = signal_t, where signal_t is computed from close_t. The fast SMA(5) is dominated by the current bar's close, so the naive position systematically flips long on large up days it could not have known about, inflating Sharpe from ~0.27 to ~0.99 on drift-only GBM.",
+      "detection": "Compare the naive position against the lagged executable position (signal.shift(1)) and count mismatch days (115 here); recompute Sharpe before and after applying .shift(1). An execution-timing choice worth more than 0.5 Sharpe is diagnostic of leakage, not alpha.",
+      "corrective_action": "Use position = signal.shift(1).fillna(0.0) before multiplying by returns, so bar t's signal is only tradeable at bar t+1; re-report all metrics from the lagged backtest only."
+    }
+  ],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": []
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "multi_turn_audit",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000004-adversarial-lookahead-sma",
+    "domain": "Trend Following / Time-Series Momentum",
+    "complexity": 4,
+    "tags": [
+      "adversarial",
+      "lookahead-bias",
+      "sma-crossover",
+      "execution-lag",
+      "backtest-audit",
+      "sharpe-inflation"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "A colleague reports a Sharpe ~1.0 from a fast SMA(5/20) crossover on a liquid index. Before admiring the number, ask the auditor's first question: WHEN is the position established relative to the information that generated it? A fast SMA is dominated by the newest close, so same-bar execution quietly conditions the position on the very return being booked. The audit plan is fixed before looking at any PnL: reproduce the naive result, then difference the naive position against the only position that was physically executable, then re-price.",
+    "tool_selection": "Python REPL with numpy/pandas only. The decisive tools are pandas .shift(1) for the executable position, a boolean position-mismatch count, and two identical backtests differing in nothing but the lag — an ablation, not an argument.",
+    "recursive_delegation": "Not needed for one strategy. In a corpus-scale audit, spawn one sub-agent per submitted backtest to run the standardized lag-ablation, and have the parent flag any strategy whose Sharpe drops by more than 0.5 under a one-bar lag — those are timestamp leaks, not signals."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "Naive claim under test: the SMA(5/20) crossover earns positive risk-adjusted returns (naive annualized Sharpe ~0.99, seed 11). Audit hypotheses — H0: the naive result is executable, i.e. Sharpe(naive) - Sharpe(lagged) <= 0.5 and the naive position equals the executable position almost everywhere. H1: the result depends on same-bar information (inflation > 0.5 with materially many mismatch days). Decision rule: if H1, reject the strategy claim entirely and report only the lagged result as the honest estimate.",
+    "data_engineering": "2000 business days of seeded GBM with 4%/yr drift and 18% vol — deliberately trend-free beyond drift so ground truth is known: no fast-crossover edge exists to find. Signals built with pandas rolling means; warm-up NaN mapped to flat, never backfilled. Costs at 2 bps per unit turnover applied identically to both backtests so the lag is the ONLY difference between them — a controlled ablation requires changing exactly one thing.",
+    "methodology_justification": "The audit is an ablation study, chosen over statistical testing as the primary instrument because the question is mechanical, not distributional: two runs identical except position_t = signal_t versus signal_{t-1}. The 0.5-Sharpe threshold encodes an economic prior — no plausible daily execution-timing skill is worth half a Sharpe on a 2-bps-cost instrument — so exceeding it identifies leakage without needing a p-value. The mismatch-day count (115/2000 bars) localizes WHERE the two backtests diverge: exactly the crossover bars, which is the fingerprint of same-bar signal use.",
+    "code_implementation": "\"\"\"ADVERSARIAL TEACHING ENTRY: same-bar execution lookahead bias.\n\nPedagogical arc: plausible strategy -> attractive naive result ->\nadversarial audit -> flaw detected -> corrected conclusion.\n\nThe naive backtest trades the SMA(5/20) crossover on the SAME bar whose\nclose generated the signal. On a pure GBM with mild drift this \"earns\" a\nSharpe near 1.0 that does not exist. The audit exposes the flaw by (a)\ncounting bars where the naive position differs from the executable\n(lagged) position, and (b) recomputing the backtest with the one-bar\nexecution lag. Deterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nimport pandas as pd\n\nRNG_SEED = 11\nN_DAYS = 2000\nANN_FACTOR = 252\nFAST, SLOW = 5, 20\nCOST_BPS = 2.0\n# Audit threshold: an execution-timing choice must never be worth this\n# much Sharpe. If removing the lag adds > 0.5, the edge lives in the\n# timestamp, not the signal.\nINFLATION_THRESHOLD = 0.5\n\n\ndef simulate_prices(n: int, seed: int) -> pd.Series:\n    \"\"\"Plain GBM: mild drift (4%/yr), 18% vol. Deliberately trend-free\n    beyond drift, so any large Sharpe MUST be an artifact.\"\"\"\n    rng = np.random.default_rng(seed)\n    mu, sigma = 0.04 / ANN_FACTOR, 0.18 / np.sqrt(ANN_FACTOR)\n    log_rets = mu - 0.5 * sigma**2 + sigma * rng.standard_normal(n)\n    idx = pd.bdate_range(\"2017-01-01\", periods=n)\n    return pd.Series(100.0 * np.exp(np.cumsum(log_rets)), index=idx, name=\"close\")\n\n\ndef sma_signal(prices: pd.Series, fast: int, slow: int) -> pd.Series:\n    fast_ma = prices.rolling(fast).mean()\n    slow_ma = prices.rolling(slow).mean()\n    sig = (fast_ma > slow_ma).astype(float)\n    sig[slow_ma.isna()] = 0.0  # flat during warm-up; never backfill\n    return sig\n\n\ndef backtest(prices: pd.Series, signal: pd.Series, lag: int, cost_bps: float) -> pd.Series:\n    \"\"\"lag=0 is the PLANTED FLAW: position_t uses signal_t, which was\n    computed from close_t — the trade sees the bar it is trading.\n    lag=1 is the executable version.\"\"\"\n    position = signal.shift(lag).fillna(0.0) if lag > 0 else signal\n    rets = prices.pct_change().fillna(0.0)\n    gross = position * rets\n    turnover = position.diff().abs().fillna(position.abs())\n    return gross - turnover * cost_bps / 1e4\n\n\ndef annualized_sharpe(rets: pd.Series) -> float:\n    sd = rets.std(ddof=1)\n    return 0.0 if sd == 0 else float(rets.mean() / sd * np.sqrt(ANN_FACTOR))\n\n\ndef main() -> None:\n    prices = simulate_prices(N_DAYS, RNG_SEED)\n    signal = sma_signal(prices, FAST, SLOW)\n\n    # --- The seductive naive result (flawed) -------------------------\n    naive = backtest(prices, signal, lag=0, cost_bps=COST_BPS)\n    naive_sharpe = annualized_sharpe(naive)\n\n    # --- Adversarial audit -------------------------------------------\n    # Detection 1: how often does the naive position differ from the\n    # position that could actually have been held at the open of bar t?\n    executable_pos = signal.shift(1).fillna(0.0)\n    mismatch_days = int((signal != executable_pos).sum())\n\n    # Detection 2: recompute with the honest one-bar lag.\n    corrected = backtest(prices, signal, lag=1, cost_bps=COST_BPS)\n    corrected_sharpe = annualized_sharpe(corrected)\n    inflation = naive_sharpe - corrected_sharpe\n\n    flawed = inflation > INFLATION_THRESHOLD\n    audit_verdict = \"REJECTED_LOOKAHEAD_BIAS\" if flawed else \"NO_MATERIAL_TIMING_EDGE\"\n\n    print(\"RESULTS\")\n    print(f\"naive_sharpe={naive_sharpe:.3f}\")\n    print(f\"corrected_sharpe={corrected_sharpe:.3f}\")\n    print(f\"sharpe_inflation={inflation:.3f}\")\n    print(f\"position_mismatch_days={mismatch_days}\")\n    print(f\"inflation_threshold={INFLATION_THRESHOLD}\")\n    print(\"flaw_type=LOOKAHEAD_BIAS\")\n    print(f\"audit_verdict={audit_verdict}\")\n    # Corrected conclusion: on drift-only GBM the honest rule has no\n    # exploitable trend edge; the naive result was pure timestamp leakage.\n    print(f\"verdict={audit_verdict}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic checks: naive_sharpe ~0.99 and corrected_sharpe ~0.27 at seed 11, inflation ~0.72 > 0.5 threshold; position_mismatch_days = 115 and every mismatch bar must be a crossover bar. Robustness: across seeds 10-19 the naive Sharpe stays in ~[0.44, 1.41] while the corrected Sharpe straddles zero (some seeds negative) — i.e. the naive estimator is biased upward everywhere while the honest estimator is correctly centered near the no-edge truth. That systematic one-sided gap, not any single number, is the statistical signature of lookahead.",
+    "risk_and_backtest_audit": "The relevant 'risk' here is epistemic: capital allocated to a leaked backtest realizes the corrected distribution (Sharpe ~0.27 gross of further real-world frictions, i.e. approximately nothing) while sized for the naive one — a direct path to oversized drawdowns. Frictions note: 2 bps is charitable; the naive rule's higher effective turnover makes real costs bite harder. Audit protocol for production: every backtest must ship with a lag-ablation table (lag 0/1/2) and any strategy whose PnL is concentrated in the lag-0 column is rejected without further review."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The trap is seductive precisely because the code LOOKS clean — one missing .shift(1) in an otherwise correct vectorized backtest; reviewers pattern-match on structure and miss timing. (2) A subtler variant plants the leak in feature construction (e.g. normalizing by the full-sample mean) where no shift call is visibly absent. (3) The 0.5 threshold is calibrated for daily bars and fast signals; slow signals leak less per bar, so a leaky SMA(50/200) could pass — threshold must scale with signal speed. (4) On real intraday data, using the close as both signal input and fill price is the same bug wearing different clothes.",
+    "falsification_strategy": "Attempt to rescue the naive result: (a) rerun on 10 fresh seeds — if the naive edge were real it should persist under the lag, and it does not; (b) set drift to zero — the corrected Sharpe collapses to ~0 while the naive one stays large, proving the naive PnL is manufactured from contemporaneous returns, not drift capture; (c) invert the test: apply lag=2 — Sharpe should not materially drop further, confirming one bar of leakage was the entire effect.",
+    "limitations": "The ablation detects timing leakage only; it cannot detect survivorship bias, parameter mining, or leaked features that survive lagging. The threshold is a calibrated heuristic, not a hypothesis test — borderline inflations (0.3-0.5) require the seed-sweep evidence instead. Synthetic GBM understates real autocorrelation structure, which can make same-bar leakage on real data even more flattering than shown here."
+  },
+  "agent_instructions": "1. Reproduce the claimed backtest exactly as submitted; record naive_sharpe. 2. Construct the executable position signal.shift(1).fillna(0.0); count bars where it differs from the naive position and verify the mismatches sit on crossover bars. 3. Rerun the identical backtest changing ONLY the lag; record corrected_sharpe. 4. Compute inflation = naive - corrected; compare to the 0.5 threshold. 5. If exceeded: print flaw_type=LOOKAHEAD_BIAS and verdict=REJECTED_LOOKAHEAD_BIAS; report the corrected number as the only honest estimate. 6. Confirm with a 10-seed sweep that the naive estimator is one-sidedly biased while the corrected one straddles zero. 7. In the final report, state the corrected conclusion first and the naive number only as the exhibit of the flaw — never the reverse.",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": [
+      "RESULTS",
+      "naive_sharpe=",
+      "corrected_sharpe=",
+      "position_mismatch_days=",
+      "flaw_type=LOOKAHEAD_BIAS",
+      "audit_verdict=REJECTED_LOOKAHEAD_BIAS",
+      "verdict=REJECTED_LOOKAHEAD_BIAS"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "pandas"
+    ]
+  }
+}

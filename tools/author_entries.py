@@ -297,7 +297,7 @@ ENTRY_SMA = {
     ),
     "verification": {
         "timeout_seconds": 120,
-        "must_print": ["RESULTS", "annualized_sharpe_net=", "bootstrap_pvalue_sharpe_gt_0=", "verdict="],
+        "must_print": ["RESULTS", "annualized_sharpe_net=", "bootstrap_pvalue_sharpe_gt_0=", "verdict=FAIL_TO_REJECT_H0"],
         "forbid_nan_in_stdout": True,
         "required_packages": ["numpy", "pandas"],
     },
@@ -448,7 +448,11 @@ def main() -> None:
     print(f"oos_max_drawdown={mdd:.4f}")
     print(f"oos_position_changes={n_trades}")
     tradeable = params["adf_p"] < 0.01 and params["halflife"] < 60.0
-    print(f"formation_verdict={'COINTEGRATED_TRADEABLE' if tradeable else 'NOT_TRADEABLE'}")
+    verdict = "COINTEGRATED_TRADEABLE" if tradeable else "NOT_TRADEABLE"
+    print(f"formation_verdict={verdict}")
+    # Canonical verdict line: every corpus entry ends stdout with
+    # verdict=<expected_verdict> so automated verdict matching is uniform.
+    print(f"verdict={verdict}")
 
 
 if __name__ == "__main__":
@@ -603,7 +607,7 @@ ENTRY_PAIRS = {
     ),
     "verification": {
         "timeout_seconds": 120,
-        "must_print": ["RESULTS", "adf_pvalue=", "halflife_days=", "oos_sharpe_net=", "formation_verdict="],
+        "must_print": ["RESULTS", "adf_pvalue=", "halflife_days=", "oos_sharpe_net=", "formation_verdict=", "verdict=COINTEGRATED_TRADEABLE"],
         "forbid_nan_in_stdout": True,
         "required_packages": ["numpy", "pandas", "statsmodels"],
     },
@@ -949,7 +953,7 @@ ENTRY_GARCH = {
     ),
     "verification": {
         "timeout_seconds": 240,
-        "must_print": ["RESULTS", "converged=True", "alpha_hat=", "dm_stat=", "dm_pvalue=", "verdict="],
+        "must_print": ["RESULTS", "converged=True", "alpha_hat=", "dm_stat=", "dm_pvalue=", "verdict=NO_SIGNIFICANT_EDGE"],
         "forbid_nan_in_stdout": True,
         "required_packages": ["numpy", "scipy"],
     },
@@ -1015,6 +1019,1148 @@ def migrate_v1_to_v2(
     }
 
 
+# =====================================================================
+# Entry 4 — complexity 4: ADVERSARIAL lookahead bias (v2-native)
+# =====================================================================
+
+CODE_LOOKAHEAD = '''"""ADVERSARIAL TEACHING ENTRY: same-bar execution lookahead bias.
+
+Pedagogical arc: plausible strategy -> attractive naive result ->
+adversarial audit -> flaw detected -> corrected conclusion.
+
+The naive backtest trades the SMA(5/20) crossover on the SAME bar whose
+close generated the signal. On a pure GBM with mild drift this "earns" a
+Sharpe near 1.0 that does not exist. The audit exposes the flaw by (a)
+counting bars where the naive position differs from the executable
+(lagged) position, and (b) recomputing the backtest with the one-bar
+execution lag. Deterministic (seeded).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+RNG_SEED = 11
+N_DAYS = 2000
+ANN_FACTOR = 252
+FAST, SLOW = 5, 20
+COST_BPS = 2.0
+# Audit threshold: an execution-timing choice must never be worth this
+# much Sharpe. If removing the lag adds > 0.5, the edge lives in the
+# timestamp, not the signal.
+INFLATION_THRESHOLD = 0.5
+
+
+def simulate_prices(n: int, seed: int) -> pd.Series:
+    """Plain GBM: mild drift (4%/yr), 18% vol. Deliberately trend-free
+    beyond drift, so any large Sharpe MUST be an artifact."""
+    rng = np.random.default_rng(seed)
+    mu, sigma = 0.04 / ANN_FACTOR, 0.18 / np.sqrt(ANN_FACTOR)
+    log_rets = mu - 0.5 * sigma**2 + sigma * rng.standard_normal(n)
+    idx = pd.bdate_range("2017-01-01", periods=n)
+    return pd.Series(100.0 * np.exp(np.cumsum(log_rets)), index=idx, name="close")
+
+
+def sma_signal(prices: pd.Series, fast: int, slow: int) -> pd.Series:
+    fast_ma = prices.rolling(fast).mean()
+    slow_ma = prices.rolling(slow).mean()
+    sig = (fast_ma > slow_ma).astype(float)
+    sig[slow_ma.isna()] = 0.0  # flat during warm-up; never backfill
+    return sig
+
+
+def backtest(prices: pd.Series, signal: pd.Series, lag: int, cost_bps: float) -> pd.Series:
+    """lag=0 is the PLANTED FLAW: position_t uses signal_t, which was
+    computed from close_t — the trade sees the bar it is trading.
+    lag=1 is the executable version."""
+    position = signal.shift(lag).fillna(0.0) if lag > 0 else signal
+    rets = prices.pct_change().fillna(0.0)
+    gross = position * rets
+    turnover = position.diff().abs().fillna(position.abs())
+    return gross - turnover * cost_bps / 1e4
+
+
+def annualized_sharpe(rets: pd.Series) -> float:
+    sd = rets.std(ddof=1)
+    return 0.0 if sd == 0 else float(rets.mean() / sd * np.sqrt(ANN_FACTOR))
+
+
+def main() -> None:
+    prices = simulate_prices(N_DAYS, RNG_SEED)
+    signal = sma_signal(prices, FAST, SLOW)
+
+    # --- The seductive naive result (flawed) -------------------------
+    naive = backtest(prices, signal, lag=0, cost_bps=COST_BPS)
+    naive_sharpe = annualized_sharpe(naive)
+
+    # --- Adversarial audit -------------------------------------------
+    # Detection 1: how often does the naive position differ from the
+    # position that could actually have been held at the open of bar t?
+    executable_pos = signal.shift(1).fillna(0.0)
+    mismatch_days = int((signal != executable_pos).sum())
+
+    # Detection 2: recompute with the honest one-bar lag.
+    corrected = backtest(prices, signal, lag=1, cost_bps=COST_BPS)
+    corrected_sharpe = annualized_sharpe(corrected)
+    inflation = naive_sharpe - corrected_sharpe
+
+    flawed = inflation > INFLATION_THRESHOLD
+    audit_verdict = "REJECTED_LOOKAHEAD_BIAS" if flawed else "NO_MATERIAL_TIMING_EDGE"
+
+    print("RESULTS")
+    print(f"naive_sharpe={naive_sharpe:.3f}")
+    print(f"corrected_sharpe={corrected_sharpe:.3f}")
+    print(f"sharpe_inflation={inflation:.3f}")
+    print(f"position_mismatch_days={mismatch_days}")
+    print(f"inflation_threshold={INFLATION_THRESHOLD}")
+    print("flaw_type=LOOKAHEAD_BIAS")
+    print(f"audit_verdict={audit_verdict}")
+    # Corrected conclusion: on drift-only GBM the honest rule has no
+    # exploitable trend edge; the naive result was pure timestamp leakage.
+    print(f"verdict={audit_verdict}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_LOOKAHEAD = {
+    "schema_version": 2,
+    "entry_kind": "adversarial",
+    "expected_verdict": "REJECTED_LOOKAHEAD_BIAS",
+    "flaws": [
+        {
+            "type": "lookahead_bias",
+            "severity": "fatal",
+            "location": "code_implementation:backtest (lag=0 branch, naive position construction)",
+            "description": (
+                "The strategy trades on the same bar whose close generated the signal: "
+                "position_t = signal_t, where signal_t is computed from close_t. The fast "
+                "SMA(5) is dominated by the current bar's close, so the naive position "
+                "systematically flips long on large up days it could not have known about, "
+                "inflating Sharpe from ~0.27 to ~0.99 on drift-only GBM."
+            ),
+            "detection": (
+                "Compare the naive position against the lagged executable position "
+                "(signal.shift(1)) and count mismatch days (115 here); recompute Sharpe "
+                "before and after applying .shift(1). An execution-timing choice worth more "
+                "than 0.5 Sharpe is diagnostic of leakage, not alpha."
+            ),
+            "corrective_action": (
+                "Use position = signal.shift(1).fillna(0.0) before multiplying by returns, "
+                "so bar t's signal is only tradeable at bar t+1; re-report all metrics from "
+                "the lagged backtest only."
+            ),
+        }
+    ],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [],
+    },
+    "rlm": MINIMAL_RLM,
+    "training_sequence": {
+        "style": "multi_turn_audit",
+        "include_adversarial_critique": True,
+        "include_final_calibrated_answer": True,
+        "loss_masking": {
+            "user": 0.0,
+            "environment_observation": 0.0,
+            "assistant_thought": 1.0,
+            "tool_call": 1.0,
+            "final_answer": 1.0,
+        },
+    },
+    "metadata": {
+        "id": "qlm1-000004-adversarial-lookahead-sma",
+        "domain": "Trend Following / Time-Series Momentum",
+        "complexity": 4,
+        "tags": [
+            "adversarial",
+            "lookahead-bias",
+            "sma-crossover",
+            "execution-lag",
+            "backtest-audit",
+            "sharpe-inflation",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "A colleague reports a Sharpe ~1.0 from a fast SMA(5/20) crossover on a liquid "
+            "index. Before admiring the number, ask the auditor's first question: WHEN is the "
+            "position established relative to the information that generated it? A fast SMA is "
+            "dominated by the newest close, so same-bar execution quietly conditions the "
+            "position on the very return being booked. The audit plan is fixed before looking "
+            "at any PnL: reproduce the naive result, then difference the naive position "
+            "against the only position that was physically executable, then re-price."
+        ),
+        "tool_selection": (
+            "Python REPL with numpy/pandas only. The decisive tools are pandas .shift(1) for "
+            "the executable position, a boolean position-mismatch count, and two identical "
+            "backtests differing in nothing but the lag — an ablation, not an argument."
+        ),
+        "recursive_delegation": (
+            "Not needed for one strategy. In a corpus-scale audit, spawn one sub-agent per "
+            "submitted backtest to run the standardized lag-ablation, and have the parent "
+            "flag any strategy whose Sharpe drops by more than 0.5 under a one-bar lag — "
+            "those are timestamp leaks, not signals."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "Naive claim under test: the SMA(5/20) crossover earns positive risk-adjusted "
+            "returns (naive annualized Sharpe ~0.99, seed 11). Audit hypotheses — H0: the "
+            "naive result is executable, i.e. Sharpe(naive) - Sharpe(lagged) <= 0.5 and the "
+            "naive position equals the executable position almost everywhere. H1: the result "
+            "depends on same-bar information (inflation > 0.5 with materially many mismatch "
+            "days). Decision rule: if H1, reject the strategy claim entirely and report only "
+            "the lagged result as the honest estimate."
+        ),
+        "data_engineering": (
+            "2000 business days of seeded GBM with 4%/yr drift and 18% vol — deliberately "
+            "trend-free beyond drift so ground truth is known: no fast-crossover edge exists "
+            "to find. Signals built with pandas rolling means; warm-up NaN mapped to flat, "
+            "never backfilled. Costs at 2 bps per unit turnover applied identically to both "
+            "backtests so the lag is the ONLY difference between them — a controlled ablation "
+            "requires changing exactly one thing."
+        ),
+        "methodology_justification": (
+            "The audit is an ablation study, chosen over statistical testing as the primary "
+            "instrument because the question is mechanical, not distributional: two runs "
+            "identical except position_t = signal_t versus signal_{t-1}. The 0.5-Sharpe "
+            "threshold encodes an economic prior — no plausible daily execution-timing skill "
+            "is worth half a Sharpe on a 2-bps-cost instrument — so exceeding it identifies "
+            "leakage without needing a p-value. The mismatch-day count (115/2000 bars) "
+            "localizes WHERE the two backtests diverge: exactly the crossover bars, which is "
+            "the fingerprint of same-bar signal use."
+        ),
+        "code_implementation": CODE_LOOKAHEAD,
+        "statistical_validation": (
+            "Deterministic checks: naive_sharpe ~0.99 and corrected_sharpe ~0.27 at seed 11, "
+            "inflation ~0.72 > 0.5 threshold; position_mismatch_days = 115 and every mismatch "
+            "bar must be a crossover bar. Robustness: across seeds 10-19 the naive Sharpe "
+            "stays in ~[0.44, 1.41] while the corrected Sharpe straddles zero (some seeds "
+            "negative) — i.e. the naive estimator is biased upward everywhere while the "
+            "honest estimator is correctly centered near the no-edge truth. That systematic "
+            "one-sided gap, not any single number, is the statistical signature of lookahead."
+        ),
+        "risk_and_backtest_audit": (
+            "The relevant 'risk' here is epistemic: capital allocated to a leaked backtest "
+            "realizes the corrected distribution (Sharpe ~0.27 gross of further real-world "
+            "frictions, i.e. approximately nothing) while sized for the naive one — a direct "
+            "path to oversized drawdowns. Frictions note: 2 bps is charitable; the naive "
+            "rule's higher effective turnover makes real costs bite harder. Audit protocol "
+            "for production: every backtest must ship with a lag-ablation table (lag 0/1/2) "
+            "and any strategy whose PnL is concentrated in the lag-0 column is rejected "
+            "without further review."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) The trap is seductive precisely because the code LOOKS clean — one missing "
+            ".shift(1) in an otherwise correct vectorized backtest; reviewers pattern-match "
+            "on structure and miss timing. (2) A subtler variant plants the leak in feature "
+            "construction (e.g. normalizing by the full-sample mean) where no shift call is "
+            "visibly absent. (3) The 0.5 threshold is calibrated for daily bars and fast "
+            "signals; slow signals leak less per bar, so a leaky SMA(50/200) could pass — "
+            "threshold must scale with signal speed. (4) On real intraday data, using the "
+            "close as both signal input and fill price is the same bug wearing different "
+            "clothes."
+        ),
+        "falsification_strategy": (
+            "Attempt to rescue the naive result: (a) rerun on 10 fresh seeds — if the naive "
+            "edge were real it should persist under the lag, and it does not; (b) set drift "
+            "to zero — the corrected Sharpe collapses to ~0 while the naive one stays large, "
+            "proving the naive PnL is manufactured from contemporaneous returns, not drift "
+            "capture; (c) invert the test: apply lag=2 — Sharpe should not materially drop "
+            "further, confirming one bar of leakage was the entire effect."
+        ),
+        "limitations": (
+            "The ablation detects timing leakage only; it cannot detect survivorship bias, "
+            "parameter mining, or leaked features that survive lagging. The threshold is a "
+            "calibrated heuristic, not a hypothesis test — borderline inflations (0.3-0.5) "
+            "require the seed-sweep evidence instead. Synthetic GBM understates real "
+            "autocorrelation structure, which can make same-bar leakage on real data even "
+            "more flattering than shown here."
+        ),
+    },
+    "agent_instructions": (
+        "1. Reproduce the claimed backtest exactly as submitted; record naive_sharpe. "
+        "2. Construct the executable position signal.shift(1).fillna(0.0); count bars where "
+        "it differs from the naive position and verify the mismatches sit on crossover bars. "
+        "3. Rerun the identical backtest changing ONLY the lag; record corrected_sharpe. "
+        "4. Compute inflation = naive - corrected; compare to the 0.5 threshold. "
+        "5. If exceeded: print flaw_type=LOOKAHEAD_BIAS and verdict=REJECTED_LOOKAHEAD_BIAS; "
+        "report the corrected number as the only honest estimate. 6. Confirm with a "
+        "10-seed sweep that the naive estimator is one-sidedly biased while the corrected "
+        "one straddles zero. 7. In the final report, state the corrected conclusion first "
+        "and the naive number only as the exhibit of the flaw — never the reverse."
+    ),
+    "verification": {
+        "timeout_seconds": 120,
+        "must_print": [
+            "RESULTS",
+            "naive_sharpe=",
+            "corrected_sharpe=",
+            "position_mismatch_days=",
+            "flaw_type=LOOKAHEAD_BIAS",
+            "audit_verdict=REJECTED_LOOKAHEAD_BIAS",
+            "verdict=REJECTED_LOOKAHEAD_BIAS",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy", "pandas"],
+    },
+}
+
+# =====================================================================
+# Entry 5 — complexity 7: ADVERSARIAL p-hacking sweep (v2-native)
+# =====================================================================
+
+CODE_PHACK = '''"""ADVERSARIAL TEACHING ENTRY: p-hacking via uncorrected parameter sweep.
+
+Pedagogical arc: plausible strategy family -> attractive best-in-sweep
+result ("Sharpe 0.86, significant at 1%!") -> adversarial audit via a
+max-statistic block-permutation test (simplified White reality check)
+-> flaw detected -> corrected conclusion.
+
+Ground truth is known by construction: prices are a DRIFTLESS seeded
+random walk, so no SMA configuration has any true edge. The sweep still
+"finds" one — that is the lesson. Deterministic (seeded).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy import stats
+
+RNG_SEED = 24
+N_DAYS = 2016              # 8 trading years
+ANN_FACTOR = 252
+COST_BPS = 2.0
+FAST_GRID = [5, 10, 15, 20, 25, 30]
+SLOW_GRID = [40, 60, 80, 100, 120, 140, 160, 180]
+N_PERM = 200               # permutation draws for the max-statistic null
+BLOCK = 21                 # block length preserves short-range dependence
+ALPHA = 0.05
+
+
+def simulate_log_returns(n: int, seed: int) -> np.ndarray:
+    """Driftless log returns, 18% annualized vol: true edge = 0 for every
+    configuration, by construction."""
+    rng = np.random.default_rng(seed)
+    sigma = 0.18 / np.sqrt(ANN_FACTOR)
+    return sigma * rng.standard_normal(n) - 0.5 * sigma**2
+
+
+def rolling_means(prices: np.ndarray, windows: list) -> dict:
+    """O(n) rolling means via cumulative sums (vectorized; no pandas row
+    loops). Warm-up cells hold +inf sentinels internally so warm-up
+    comparisons are False; sentinels never reach stdout."""
+    out = {}
+    c = np.concatenate([[0.0], np.cumsum(prices)])
+    for w in windows:
+        m = np.full(len(prices), np.inf)
+        m[w - 1:] = (c[w:] - c[:-w]) / w
+        out[w] = m
+    return out
+
+
+def strategy_sharpes(prices: np.ndarray, cost_bps: float) -> np.ndarray:
+    """Annualized net Sharpe for every (fast, slow) configuration.
+
+    Every backtest here is individually HONEST: one-bar execution lag,
+    turnover costs. The planted flaw is not in the backtests — it is in
+    what is done with 48 of them afterwards.
+    """
+    n = len(prices)
+    rets = np.empty(n)
+    rets[0] = 0.0
+    rets[1:] = prices[1:] / prices[:-1] - 1.0
+    smas = rolling_means(prices, sorted(set(FAST_GRID + SLOW_GRID)))
+    sharpes = np.empty(len(FAST_GRID) * len(SLOW_GRID))
+    k = 0
+    for f in FAST_GRID:                # loop over configurations, not rows
+        for s in SLOW_GRID:
+            sig = (smas[f] > smas[s]).astype(float)
+            sig[: s - 1] = 0.0         # flat during warm-up
+            pos = np.empty(n)
+            pos[0] = 0.0
+            pos[1:] = sig[:-1]         # honest one-bar execution lag
+            net = pos * rets - np.abs(np.diff(pos, prepend=0.0)) * cost_bps / 1e4
+            sd = net.std(ddof=1)
+            sharpes[k] = 0.0 if sd == 0 else net.mean() / sd * np.sqrt(ANN_FACTOR)
+            k += 1
+    return sharpes
+
+
+def block_permute(log_rets: np.ndarray, rng: np.random.Generator, block: int) -> np.ndarray:
+    """Circular-style moving-block resample: destroys any (spurious)
+    signal-return alignment while preserving local dependence."""
+    n = len(log_rets)
+    n_blocks = int(np.ceil(n / block))
+    starts = rng.integers(0, n - block + 1, size=n_blocks)
+    idx = (starts[:, None] + np.arange(block)[None, :]).ravel()[:n]
+    return log_rets[idx]
+
+
+def max_stat_permutation(log_rets: np.ndarray, observed_best: float,
+                         n_perm: int, seed: int) -> tuple:
+    """Simplified White reality check: the null distribution of the MAX
+    Sharpe across the whole grid, not of a single strategy's Sharpe.
+
+    THE key audit idea: 'best of 48' must be compared against 'best of
+    48 under the null', never against 'one strategy under the null'.
+    """
+    rng = np.random.default_rng(seed)
+    max_null = np.empty(n_perm)
+    for b in range(n_perm):            # each permutation draw is independent
+        perm = block_permute(log_rets, rng, BLOCK)
+        p_prices = 100.0 * np.exp(np.cumsum(perm))
+        max_null[b] = strategy_sharpes(p_prices, COST_BPS).max()
+    p_corrected = float((1.0 + (max_null >= observed_best).sum()) / (n_perm + 1.0))
+    return p_corrected, float(max_null.mean())
+
+
+def main() -> None:
+    log_rets = simulate_log_returns(N_DAYS, RNG_SEED)
+    prices = 100.0 * np.exp(np.cumsum(log_rets))
+
+    # --- The seductive naive procedure (flawed) ----------------------
+    sharpes = strategy_sharpes(prices, COST_BPS)
+    n_tested = len(sharpes)
+    best_idx = int(sharpes.argmax())
+    best_sharpe = float(sharpes.max())
+    best_fast = FAST_GRID[best_idx // len(SLOW_GRID)]
+    best_slow = SLOW_GRID[best_idx % len(SLOW_GRID)]
+    # Naive inference treats the winner as if it were the only test run:
+    t_stat = best_sharpe * np.sqrt(N_DAYS / ANN_FACTOR)
+    naive_p = float(1.0 - stats.norm.cdf(t_stat))
+
+    # --- Adversarial audit -------------------------------------------
+    # Correction 1 (cheap): Bonferroni on the naive p-value.
+    bonferroni_p = float(min(1.0, n_tested * naive_p))
+    # Correction 2 (proper): max-statistic permutation null.
+    corrected_p, null_max_mean = max_stat_permutation(
+        log_rets, best_sharpe, N_PERM, RNG_SEED + 1
+    )
+
+    hacked = naive_p < ALPHA and corrected_p >= ALPHA
+    audit_verdict = "REJECTED_P_HACKING" if hacked else (
+        "SELECTION_SURVIVES_CORRECTION" if corrected_p < ALPHA else "NO_NAIVE_SIGNIFICANCE"
+    )
+
+    print("RESULTS")
+    print(f"n_parameters_tested={n_tested}")
+    print(f"best_config=sma_{best_fast}_{best_slow}")
+    print(f"best_naive_sharpe={best_sharpe:.3f}")
+    print(f"naive_pvalue={naive_p:.5f}")
+    print(f"bonferroni_pvalue={bonferroni_p:.5f}")
+    print(f"corrected_pvalue={corrected_p:.5f}")
+    print(f"null_max_sharpe_mean={null_max_mean:.3f}")
+    print("flaw_type=P_HACKING")
+    print(f"audit_verdict={audit_verdict}")
+    # Corrected conclusion: on a driftless random walk the expected max
+    # Sharpe over 48 trials is ~0.57 — the "discovery" is the order
+    # statistic of noise, exactly as the permutation null predicts.
+    print(f"verdict={audit_verdict}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_PHACK = {
+    "schema_version": 2,
+    "entry_kind": "adversarial",
+    "expected_verdict": "REJECTED_P_HACKING",
+    "flaws": [
+        {
+            "type": "p_hacking",
+            "severity": "fatal",
+            "location": "code_implementation:main (best-of-sweep selection and naive_p inference)",
+            "description": (
+                "The best configuration (SMA 15/120, Sharpe 0.86, 'p=0.008') was selected "
+                "from 48 trials on a driftless random walk and its p-value computed as if it "
+                "were the only test ever run; the expected MAX Sharpe over 48 null trials is "
+                "~0.57, so the winner is an order statistic of noise."
+            ),
+            "detection": (
+                "Apply a multiple-testing correction to the best observed statistic: compare "
+                "it against the permutation null distribution of the grid-wide MAX Sharpe "
+                "(simplified White reality check). Here the corrected p-value is ~0.19 vs a "
+                "naive 0.008 — significance evaporates under the correct null."
+            ),
+            "corrective_action": (
+                "Report max-statistic-corrected p-values (or at minimum Bonferroni, here "
+                "~0.36) for any swept statistic, or confirm the selected configuration on a "
+                "sealed holdout that played no role in selection before reporting it."
+            ),
+        },
+        {
+            "type": "multiple_testing_abuse",
+            "severity": "high",
+            "location": "research_corpus:data_engineering (grid design)",
+            "description": (
+                "The 6x8 grid contains heavily overlapping configurations (correlated "
+                "strategies), which makes the naive 'winner looks stable across neighbors' "
+                "defense misleading: neighboring cells share most of their trades, so an "
+                "apparent plateau of good Sharpes is one lucky draw seen 48 times, not 48 "
+                "confirmations."
+            ),
+            "detection": (
+                "Compute the correlation matrix of the 48 strategy return streams; mean "
+                "pairwise correlations far above zero mean the effective number of "
+                "independent trials is far below 48, and 'neighborhood stability' arguments "
+                "must be discarded in favor of the max-statistic null, which handles the "
+                "correlation automatically."
+            ),
+            "corrective_action": (
+                "Always use a correction that preserves the dependence structure "
+                "(permutation/bootstrap of the full grid) rather than treating grid cells "
+                "as independent evidence; never argue significance from parameter-plateau "
+                "smoothness alone."
+            ),
+        },
+    ],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [
+            {
+                "function": "strategy_sharpes",
+                "reason": "loop over 48 strategy configurations (not over time/rows); each config's backtest is fully vectorized",
+                "max_iterations": 48,
+            },
+            {
+                "function": "max_stat_permutation",
+                "reason": "each permutation draw must be generated and evaluated independently to build the null",
+                "max_iterations": 200,
+            },
+        ],
+    },
+    "rlm": MINIMAL_RLM,
+    "training_sequence": {
+        "style": "multi_turn_audit",
+        "include_adversarial_critique": True,
+        "include_final_calibrated_answer": True,
+        "loss_masking": {
+            "user": 0.0,
+            "environment_observation": 0.0,
+            "assistant_thought": 1.0,
+            "tool_call": 1.0,
+            "final_answer": 1.0,
+        },
+    },
+    "metadata": {
+        "id": "qlm1-000005-adversarial-p-hacking-sweep",
+        "domain": "Parameter Selection / Multiple Testing",
+        "complexity": 7,
+        "tags": [
+            "adversarial",
+            "p-hacking",
+            "multiple-testing",
+            "reality-check",
+            "max-statistic",
+            "block-permutation",
+            "parameter-sweep",
+            "order-statistics",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "A researcher swept 48 SMA configurations, found one with Sharpe 0.86 and "
+            "p=0.008, and wants to trade it. The audit question is not 'is 0.86 good?' but "
+            "'good compared to WHAT null?'. Selecting the maximum of 48 correlated trials "
+            "changes the null distribution from 'one strategy's Sharpe' to 'the maximum of "
+            "48 strategies' Sharpes' — and on pure noise that maximum averages ~0.57. The "
+            "audit must rebuild the correct null with the selection step INSIDE it."
+        ),
+        "tool_selection": (
+            "Python REPL with numpy for the vectorized grid backtests and the block-"
+            "permutation engine, scipy.stats for the naive normal p-value (kept only as the "
+            "exhibit of the flaw). No statsmodels needed — the permutation test builds its "
+            "own null."
+        ),
+        "recursive_delegation": (
+            "The 200 permutation draws are embarrassingly parallel: delegate shards of "
+            "draws to sub-agents, each returning its vector of null max-Sharpes. The parent "
+            "MUST own the selection step and the final quantile computation — delegating "
+            "'find the best config' to one agent and 'test it' to another without sharing "
+            "the trial count is exactly how p-hacking happens organizationally."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "Naive claim: the best swept configuration (SMA 15/120) has true Sharpe > 0 "
+            "(naive one-sided p=0.008 from SR*sqrt(T_years) ~ N(0,1)). Audit hypotheses — "
+            "H0: all 48 configurations have zero true edge and the observed best is the "
+            "expected order statistic of noise; H1: the best configuration's edge exceeds "
+            "what maximal selection from 48 correlated null trials produces. Test: "
+            "p_corrected = (1 + #{max-null draws >= observed best}) / (B+1) under a "
+            "moving-block permutation null (B=200, block 21), plus Bonferroni as a cheap "
+            "upper-bound cross-check. Ground truth is H0 by construction (driftless walk)."
+        ),
+        "data_engineering": (
+            "2016 days (8 years) of seeded DRIFTLESS log returns at 18% vol — the "
+            "generator guarantees every strategy's true edge is exactly zero, so any "
+            "'discovery' is definitionally spurious and the audit's job is to say so. "
+            "Grid: 6 fast x 8 slow = 48 configurations. Every individual backtest is "
+            "honest (one-bar lag, 2 bps turnover costs, warm-up flat): the flaw is planted "
+            "exclusively in the inference-after-selection step, which is what makes this "
+            "entry seductive — reading any single backtest reveals nothing wrong."
+        ),
+        "methodology_justification": (
+            "The max-statistic permutation test (simplified White 2000 reality check) is "
+            "the appropriate correction because it (a) uses the null distribution of the "
+            "SELECTED statistic — the grid maximum — rather than a single strategy's, and "
+            "(b) preserves the correlation structure across the 48 strategies "
+            "automatically, since each permutation re-runs the entire grid on the same "
+            "resampled path. Bonferroni is reported alongside as the assumption-free upper "
+            "bound: it over-corrects under correlation, so agreement between both (neither "
+            "significant) is decisive. Block permutation (block 21) rather than IID "
+            "shuffling preserves short-range dependence so the null is not artificially "
+            "easy to beat."
+        ),
+        "code_implementation": CODE_PHACK,
+        "statistical_validation": (
+            "Deterministic values at seed 24: best_naive_sharpe ~0.86 (config sma_15_120), "
+            "naive_pvalue ~0.008 (looks significant at 1%), bonferroni_pvalue ~0.36, "
+            "corrected_pvalue ~0.19, null_max_sharpe_mean ~0.57. The audit verdict requires "
+            "the conjunction naive_p < 0.05 AND corrected_p >= 0.05 — i.e. the entry "
+            "certifies specifically that naive inference and corrected inference disagree, "
+            "which is the operational definition of p-hacking. Cross-seed behavior "
+            "(21-28): naive p is 'significant' in 5 of 8 seeds while corrected p is never "
+            "below 0.05 — the naive procedure's false-discovery rate is the lesson."
+        ),
+        "risk_and_backtest_audit": (
+            "Deploying the swept winner realizes zero expected edge minus costs: the "
+            "certain outcome is negative carry with Sharpe ~0, sized as if it were 0.86 — "
+            "and because the selection favored configurations that fit one path's noise, "
+            "realized performance typically disappoints even the corrected estimate "
+            "(regression to the mean past zero after costs). Institutional audit protocol: "
+            "every reported statistic must carry its trial count n_parameters_tested; any "
+            "research note quoting a swept result without it is returned unread; holdout "
+            "windows are sealed BEFORE the sweep is designed, and one holdout look is "
+            "budgeted per project, not per configuration."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) The seduction is structural: every individual backtest in the sweep is "
+            "clean, so no code review of any single cell finds the flaw — it exists only "
+            "at the level of the procedure. (2) The naive defense 'neighboring parameters "
+            "also look good' is invalid under correlation: overlapping SMA configs share "
+            "trades, so a plateau is one lucky draw echoed 48 times. (3) 200 permutations "
+            "bound the corrected p-value at ~0.005 resolution; claiming corrected "
+            "significance near that floor requires more draws. (4) Bonferroni over-corrects "
+            "under correlation and can be waved away by a motivated researcher — which is "
+            "why the permutation test, not Bonferroni, must carry the verdict. (5) The "
+            "same flaw recurs disguised as 'walk-forward optimization' when the walk-"
+            "forward scheme itself was tuned across many variants."
+        ),
+        "falsification_strategy": (
+            "Attempt to rescue the discovery: (a) plant a REAL edge (add 4%/yr drift so "
+            "trend rules genuinely help) and verify the same pipeline then yields "
+            "corrected_p < 0.05 — confirming the audit has power and is not a machine that "
+            "rejects everything; (b) shrink the grid to the single pre-registered config "
+            "sma_15_120 and rerun on 100 fresh seeds — its Sharpe distribution centers on "
+            "zero, directly falsifying the claim the sweep 'found' something; (c) double "
+            "N_PERM and confirm corrected_p is stable (~0.19), ruling out permutation-count "
+            "artifacts."
+        ),
+        "limitations": (
+            "The permutation null assumes block-stationarity; genuine long-memory "
+            "structure beyond 21-day blocks would be partially destroyed, slightly "
+            "cheapening the null. The simplified reality check tests only the single best "
+            "configuration, not the full stepdown family (Romano-Wolf) needed to certify "
+            "multiple survivors. The naive p-value's normal approximation for Sharpe "
+            "ignores skew/kurtosis corrections (Lo 2002) — immaterial here since the audit "
+            "rejects regardless, but material when verdicts are borderline. Conclusions "
+            "transfer to real data only after adding the corrections this entry "
+            "deliberately omits from the naive path."
+        ),
+    },
+    "agent_instructions": (
+        "1. Reproduce the sweep exactly: 48 configs, honest per-config backtests, record "
+        "every Sharpe — never only the winner. 2. Record n_parameters_tested BEFORE any "
+        "selection; this number is part of the result, not metadata. 3. Compute the naive "
+        "p-value for the best config and label it explicitly as pre-correction. 4. Run the "
+        "max-statistic block-permutation null (>=200 draws): re-run the FULL grid per draw "
+        "and take the max. 5. Compute corrected_p with the +1 finite-sample adjustment; "
+        "cross-check with Bonferroni. 6. Verdict rule: naive_p < 0.05 AND corrected_p >= "
+        "0.05 => REJECTED_P_HACKING; report the corrected number first. 7. Power check: "
+        "rerun the pipeline on a drifted DGP and confirm it CAN pass a real edge — an "
+        "audit that rejects everything is as useless as one that rejects nothing. 8. In "
+        "the final report, show the null-max distribution mean (~0.57) next to the "
+        "'discovery' (0.86) so the order-statistic nature of the result is visible at a "
+        "glance."
+    ),
+    "verification": {
+        "timeout_seconds": 240,
+        "must_print": [
+            "RESULTS",
+            "n_parameters_tested=48",
+            "best_naive_sharpe=",
+            "naive_pvalue=",
+            "corrected_pvalue=",
+            "flaw_type=P_HACKING",
+            "audit_verdict=REJECTED_P_HACKING",
+            "verdict=REJECTED_P_HACKING",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy", "scipy"],
+    },
+}
+
+# =====================================================================
+# Entry 6 — complexity 8: RLM environment interaction (v2-native)
+# =====================================================================
+
+CODE_RLM = '''"""RLM TEACHING ENTRY: quantitative research as ENVIRONMENT INTERACTION.
+
+Instead of a monolithic script, the research workflow is exposed as a
+stateful environment with a gym-like reset/step API. The agent must:
+
+  inspect -> act -> read observation -> decide next action -> verify
+
+Two actions in the scripted plan are deliberately out of order; the
+environment refuses them with error observations instead of raising, and
+the agent recovers by reordering — teaching observation-driven control
+flow rather than script-following. All observations are JSON-serializable
+dicts. Deterministic (seeded); replay is verified.
+"""
+
+from __future__ import annotations
+
+import json
+
+import numpy as np
+from scipy import stats
+from scipy.optimize import minimize
+
+RNG_SEED = 123
+N_TOTAL, N_BURN, N_TRAIN = 3000, 500, 2000
+TRUE_OMEGA, TRUE_ALPHA, TRUE_BETA = 0.05, 0.08, 0.90   # percent^2 units
+EWMA_LAMBDA = 0.94
+VAR_FLOOR = 1e-8
+DM_LAG = 10
+
+
+def _simulate_garch(n: int, burn: int, seed: int) -> np.ndarray:
+    """Seeded GARCH(1,1) returns in percent units; burn-in discarded."""
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal(n + burn)
+    sigma2 = np.empty(n + burn)
+    r = np.empty(n + burn)
+    sigma2[0] = TRUE_OMEGA / (1.0 - TRUE_ALPHA - TRUE_BETA)
+    r[0] = np.sqrt(sigma2[0]) * z[0]
+    for t in range(1, n + burn):       # GARCH recursion: inherently sequential
+        sigma2[t] = TRUE_OMEGA + TRUE_ALPHA * r[t - 1] ** 2 + TRUE_BETA * sigma2[t - 1]
+        r[t] = np.sqrt(sigma2[t]) * z[t]
+    return r[burn:]
+
+
+def _garch_filter(r: np.ndarray, omega: float, alpha: float, beta: float) -> np.ndarray:
+    n = len(r)
+    s2 = np.empty(n)
+    s2[0] = max(r.var(), VAR_FLOOR)
+    for t in range(1, n):              # depends on s2[t-1]: sequential by nature
+        s2[t] = max(omega + alpha * r[t - 1] ** 2 + beta * s2[t - 1], VAR_FLOOR)
+    return s2
+
+
+def _neg_loglik(params: np.ndarray, r: np.ndarray) -> float:
+    omega, alpha, beta = params
+    if omega <= 0.0 or alpha < 0.0 or beta < 0.0 or alpha + beta >= 0.999:
+        return 1e10                    # infeasible region: reject cheaply
+    s2 = _garch_filter(r, omega, alpha, beta)
+    return float(0.5 * (np.log(2.0 * np.pi) + np.log(s2) + r**2 / s2).sum())
+
+
+class QuantEnvironment:
+    """Stateful volatility-research environment.
+
+    API: obs = env.step({"name": <action>}). Observations are plain
+    dicts (JSON-serializable). Precondition violations return
+    {"ok": False, "error": ...} — the environment NEVER raises for a
+    bad action ordering, because the agent is supposed to read
+    observations and re-plan, not crash.
+    """
+
+    ACTIONS = ("reset", "fit_train", "forecast_oos", "evaluate_qlike", "run_dm_test")
+
+    def __init__(self, seed: int = RNG_SEED):
+        self._seed = seed
+        self._state = "uninitialized"
+        self._r = None
+        self._fit = None
+        self._s2_garch = None
+        self._s2_ewma = None
+        self._ql = None
+
+    def reset(self) -> dict:
+        self._r = _simulate_garch(N_TOTAL, N_BURN, self._seed)
+        self._fit = None
+        self._s2_garch = None
+        self._s2_ewma = None
+        self._ql = None
+        self._state = "reset"
+        return {"ok": True, "state": self._state, "n_obs": int(len(self._r)),
+                "n_train": N_TRAIN, "sample_var": round(float(self._r.var()), 4)}
+
+    def step(self, action: dict) -> dict:
+        name = action.get("name")
+        if name not in self.ACTIONS:
+            return {"ok": False, "error": f"unknown action: {name}", "state": self._state}
+        if name == "reset":
+            return self.reset()
+        if self._state == "uninitialized":
+            return {"ok": False, "error": "call reset first", "state": self._state}
+        return getattr(self, f"_do_{name}")(action)
+
+    def _do_fit_train(self, action: dict) -> dict:
+        r_train = self._r[:N_TRAIN]
+        x0 = np.array([r_train.var() * 0.05, 0.10, 0.85])   # variance-targeted start
+        res = minimize(_neg_loglik, x0, args=(r_train,), method="Nelder-Mead",
+                       options={"xatol": 1e-6, "fatol": 1e-6, "maxiter": 5000})
+        omega, alpha, beta = (float(v) for v in res.x)
+        self._fit = {"omega": omega, "alpha": alpha, "beta": beta}
+        self._state = "fitted"
+        return {"ok": True, "state": self._state,
+                "params": {"omega": round(omega, 4), "alpha": round(alpha, 4),
+                           "beta": round(beta, 4)},
+                "persistence": round(alpha + beta, 4), "converged": bool(res.success)}
+
+    def _do_forecast_oos(self, action: dict) -> dict:
+        if self._fit is None:
+            return {"ok": False, "error": "fit_train before forecast_oos", "state": self._state}
+        s2 = _garch_filter(self._r, self._fit["omega"], self._fit["alpha"], self._fit["beta"])
+        self._s2_garch = s2[N_TRAIN:]                       # frozen-parameter OOS
+        e2 = np.empty(len(self._r))
+        e2[0] = max(self._r[:50].var(), VAR_FLOOR)
+        for t in range(1, len(self._r)):                    # EWMA recursion: sequential
+            e2[t] = max(EWMA_LAMBDA * e2[t - 1] + (1.0 - EWMA_LAMBDA) * self._r[t - 1] ** 2,
+                        VAR_FLOOR)
+        self._s2_ewma = e2[N_TRAIN:]
+        self._state = "forecasted"
+        return {"ok": True, "state": self._state, "n_forecasts": int(len(self._s2_garch)),
+                "garch_mean_var": round(float(self._s2_garch.mean()), 4),
+                "ewma_mean_var": round(float(self._s2_ewma.mean()), 4)}
+
+    def _do_evaluate_qlike(self, action: dict) -> dict:
+        if self._s2_garch is None:
+            return {"ok": False, "error": "forecast_oos before evaluate_qlike",
+                    "state": self._state}
+        r2 = self._r[N_TRAIN:] ** 2
+        ql_g = np.log(self._s2_garch) + r2 / self._s2_garch
+        ql_e = np.log(self._s2_ewma) + r2 / self._s2_ewma
+        self._ql = (ql_g, ql_e)
+        self._state = "evaluated"
+        return {"ok": True, "state": self._state,
+                "qlike_garch": round(float(ql_g.mean()), 5),
+                "qlike_ewma": round(float(ql_e.mean()), 5)}
+
+    def _do_run_dm_test(self, action: dict) -> dict:
+        if self._ql is None:
+            return {"ok": False, "error": "evaluate_qlike before run_dm_test",
+                    "state": self._state}
+        d = self._ql[0] - self._ql[1]
+        n = len(d)
+        u = d - d.mean()
+        var_hac = float(u @ u) / n
+        for k in range(1, DM_LAG + 1):                      # HAC lag sum: bounded loop
+            var_hac += 2.0 * (1.0 - k / (DM_LAG + 1.0)) * float(u[k:] @ u[:-k]) / n
+        var_hac = max(var_hac, VAR_FLOOR)
+        dm = float(d.mean() / np.sqrt(var_hac / n))
+        p = float(2.0 * (1.0 - stats.norm.cdf(abs(dm))))
+        self._state = "tested"
+        return {"ok": True, "state": self._state, "dm_stat": round(dm, 3),
+                "dm_pvalue": round(p, 5),
+                "conclusion": "GARCH_BEATS_EWMA" if (dm < 0 and p < 0.05)
+                else "NO_SIGNIFICANT_EDGE"}
+
+
+def main() -> None:
+    env = QuantEnvironment(seed=RNG_SEED)
+    # Scripted agent plan with TWO deliberate ordering mistakes: the agent
+    # must read the error observations and recover, not crash.
+    plan = [
+        {"name": "fit_train"},        # invalid: environment not reset yet
+        {"name": "reset"},
+        {"name": "fit_train"},
+        {"name": "evaluate_qlike"},   # invalid: nothing forecasted yet
+        {"name": "forecast_oos"},
+        {"name": "evaluate_qlike"},
+        {"name": "run_dm_test"},
+    ]
+    executed = []
+    guard_failures = 0
+    obs = None
+    for action in plan:
+        obs = env.step(action)
+        print(f"trace={json.dumps({'action': action['name'], 'observation': obs}, sort_keys=True)}")
+        if obs["ok"]:
+            executed.append(action["name"])
+        else:
+            guard_failures += 1
+
+    # Environment verification battery.
+    checks = {
+        "guards_rejected_both_unordered_actions": guard_failures == 2,
+        "recovered_full_action_sequence": executed == list(QuantEnvironment.ACTIONS),
+        "final_observation_json_roundtrip": json.loads(json.dumps(obs)) == obs,
+        "dm_stat_finite": bool(obs["ok"] and np.isfinite(obs["dm_stat"])),
+        "honest_conclusion_preserved": obs.get("conclusion") == "NO_SIGNIFICANT_EDGE",
+    }
+    # Determinism: an identical fresh environment must replay identically.
+    env2 = QuantEnvironment(seed=RNG_SEED)
+    obs2 = None
+    for action in plan:
+        obs2 = env2.step(action)
+    checks["deterministic_replay"] = obs == obs2
+
+    print("RESULTS")
+    print("environment_class=QuantEnvironment")
+    print(f"actions_executed={','.join(executed)}")
+    print(f"guard_failures_handled={guard_failures}")
+    for name, passed in checks.items():
+        print(f"check_{name}={passed}")
+    print(f"final_observation={json.dumps(obs, sort_keys=True)}")
+    verdict = "ENVIRONMENT_VERIFIED" if all(checks.values()) else "ENVIRONMENT_BROKEN"
+    print(f"verdict={verdict}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+ENTRY_RLM = {
+    "schema_version": 2,
+    "entry_kind": "rlm_environment",
+    "expected_verdict": "ENVIRONMENT_VERIFIED",
+    "flaws": [],
+    "static_checks": {
+        "require_vectorized": True,
+        "forbid_pandas_row_loops": True,
+        "allowed_sequential_loops": [
+            {
+                "function": "_simulate_garch",
+                "reason": "GARCH variance recursion is inherently sequential",
+                "max_iterations": 3500,
+            },
+            {
+                "function": "_garch_filter",
+                "reason": "conditional variance filter depends on s2[t-1]",
+                "max_iterations": 3000,
+            },
+            {
+                "function": "QuantEnvironment._do_forecast_oos",
+                "reason": "EWMA benchmark recursion depends on e2[t-1]",
+                "max_iterations": 3000,
+            },
+            {
+                "function": "QuantEnvironment._do_run_dm_test",
+                "reason": "HAC autocovariance sum over lags 1..DM_LAG",
+                "max_iterations": 10,
+            },
+            {
+                "function": "main",
+                "reason": "agent action loop: each step depends on the previous observation",
+                "max_iterations": 7,
+            },
+        ],
+    },
+    "rlm": {
+        "environment_class": "QuantEnvironment",
+        "actions": ["reset", "fit_train", "forecast_oos", "evaluate_qlike", "run_dm_test"],
+        "max_recursion_depth": 3,
+        "tool_timeout_seconds": 120,
+    },
+    "training_sequence": {
+        "style": "environment_interaction",
+        "include_adversarial_critique": True,
+        "include_final_calibrated_answer": True,
+        "loss_masking": {
+            "user": 0.0,
+            "environment_observation": 0.0,
+            "assistant_thought": 1.0,
+            "tool_call": 1.0,
+            "final_answer": 1.0,
+        },
+    },
+    "metadata": {
+        "id": "qlm1-000006-rlm-environment-garch",
+        "domain": "Volatility Modeling / Environment Interaction",
+        "complexity": 8,
+        "tags": [
+            "rlm",
+            "environment",
+            "tool-use",
+            "state-machine",
+            "garch",
+            "qlike",
+            "diebold-mariano",
+            "error-recovery",
+            "deterministic-replay",
+        ],
+    },
+    "agent_thought_process": {
+        "initial_analysis": (
+            "The task is not 'forecast volatility' but 'conduct the forecasting study "
+            "THROUGH an environment': every research step is an action whose result "
+            "arrives as an observation, and the next action must be chosen from the "
+            "observation, not from a memorized script. The plan contains ordering "
+            "mistakes on purpose — fit before reset, evaluate before forecast — because "
+            "the behavior worth learning is reading {'ok': False, 'error': ...} and "
+            "re-planning, not assuming success. State lives in the environment, not the "
+            "agent: the agent's memory is the observation trace."
+        ),
+        "tool_selection": (
+            "Python REPL hosting the environment class; numpy/scipy inside the "
+            "environment for GARCH QMLE, forecasting, QLIKE, and the DM test; json for "
+            "the observation protocol — every observation must round-trip through "
+            "json.dumps/loads, because a real RLM agent consumes observations as "
+            "serialized tool output, never as live Python objects."
+        ),
+        "recursive_delegation": (
+            "The environment is the delegation boundary: a parent agent can hand a "
+            "sub-agent the environment handle plus a goal ('produce a DM verdict') and "
+            "judge it purely on the observation trace. Recursion depth 3 covers "
+            "parent -> research sub-agent -> verification sub-agent replaying the trace "
+            "against a fresh seeded environment to confirm determinism — the replay "
+            "check in the code is exactly that verification step, performed inline."
+        ),
+    },
+    "research_corpus": {
+        "hypothesis_formulation": (
+            "Environment-level hypotheses (the research content — GARCH vs EWMA under "
+            "QLIKE with a DM test — inherits its H0/H1 from entry qlm1-000003): H0-env: "
+            "the environment is NOT a faithful research instrument — it permits invalid "
+            "action orderings, returns non-serializable or non-finite observations, or "
+            "replays non-deterministically. H1-env: all guards hold, all observations "
+            "are JSON-round-trippable and finite, the full action sequence is reachable "
+            "after error recovery, and an identical seeded environment replays the exact "
+            "trace. Verdict ENVIRONMENT_VERIFIED requires every check to pass; a single "
+            "failure yields ENVIRONMENT_BROKEN."
+        ),
+        "data_engineering": (
+            "Data is generated INSIDE the environment on reset(): 3000 days of seeded "
+            "GARCH(1,1) returns in percent units (burn-in 500 discarded), train/test "
+            "split 2000/1000 fixed by the environment, not the agent — so no agent "
+            "action can move the split boundary and leak test data into fitting. "
+            "Observations expose only aggregates (sample variance, parameter estimates, "
+            "mean forecasts, losses), never raw future returns, which is the "
+            "information-hygiene property that makes the environment safe to hand to an "
+            "untrusted optimizing agent."
+        ),
+        "methodology_justification": (
+            "A state machine with explicit preconditions (reset -> fitted -> forecasted "
+            "-> evaluated -> tested) is chosen over free function calls because ordering "
+            "IS the methodology in walk-forward research: forecasting before fitting or "
+            "evaluating before forecasting are not programming errors but research "
+            "errors, and the environment encodes them as such. Guards return error "
+            "observations instead of raising, because exception-crashing teaches the "
+            "agent nothing — observation-driven recovery is the trainable behavior. The "
+            "embedded quant methodology (Gaussian QMLE via Nelder-Mead, frozen-parameter "
+            "OOS forecasts, QLIKE, DM with Bartlett HAC) is inherited unchanged from the "
+            "verified correct entry qlm1-000003, so this entry adds interaction "
+            "structure, not new statistical claims."
+        ),
+        "code_implementation": CODE_RLM,
+        "statistical_validation": (
+            "Six machine-checked environment invariants, all printed as check_* lines: "
+            "(1) both deliberately unordered actions rejected by guards; (2) the full "
+            "five-action sequence completes after recovery; (3) the final observation "
+            "survives a json round-trip; (4) the DM statistic is finite; (5) the "
+            "environment's conclusion equals NO_SIGNIFICANT_EDGE — the honest verdict "
+            "inherited from the underlying study (dm_stat ~ -1.127, p ~ 0.26), so the "
+            "interaction wrapper preserves calibrated uncertainty rather than "
+            "manufacturing a win; (6) deterministic replay: a fresh environment with the "
+            "same seed reproduces the final observation exactly. The verdict is the "
+            "conjunction of all six."
+        ),
+        "risk_and_backtest_audit": (
+            "Environment-specific risks replace market frictions here: (a) state leakage "
+            "— a buggy environment that lets evaluate_qlike run before forecast_oos "
+            "would silently score in-sample fits as OOS; the guard tests exist to catch "
+            "exactly this class; (b) nondeterminism — an environment that draws fresh "
+            "randomness per step makes agent trajectories unreproducible and RLM "
+            "training data worthless, hence the replay check; (c) observation overflow — "
+            "returning raw arrays would blow up serialized traces and leak future data; "
+            "observations are capped to scalar aggregates; (d) the timeout contract "
+            "(120s) bounds the cost of any single action so a stuck optimizer cannot "
+            "hang a training-data generation run."
+        ),
+    },
+    "adversarial_critique": {
+        "potential_pitfalls": (
+            "(1) A scripted plan that happens to be in the right order would pass "
+            "without demonstrating recovery — the deliberate mistakes are load-bearing; "
+            "removing them silently weakens the entry to a monolithic script with extra "
+            "steps. (2) Guards that raise exceptions instead of returning error "
+            "observations would still 'work' in this driver but teach crash-on-error to "
+            "the student model. (3) Rounding observations to 4-5 decimals is required "
+            "for stable replay comparison, but over-aggressive rounding could mask real "
+            "nondeterminism — the replay check compares the rounded dicts, so keep "
+            "rounding no coarser than shown. (4) The environment's honest "
+            "NO_SIGNIFICANT_EDGE conclusion must never be 'fixed' to a win to make the "
+            "trace look more satisfying — that would smuggle motivated reasoning into "
+            "the RLM corpus."
+        ),
+        "falsification_strategy": (
+            "Break the environment on purpose and confirm the battery catches it: (a) "
+            "remove the fit_train guard — check 1 fails and the verdict flips to "
+            "ENVIRONMENT_BROKEN; (b) inject a fresh random seed per reset — the replay "
+            "check fails; (c) return the raw returns array in an observation — the json "
+            "round-trip stays technically true but trace size explodes: add a size "
+            "budget assertion when scaling; (d) flip the DM conclusion logic — check 5 "
+            "fails, proving the wrapper cannot silently change the underlying study's "
+            "verdict."
+        ),
+        "limitations": (
+            "The scripted plan exercises one error-recovery path; a full RLM curriculum "
+            "needs many plans (shuffled orders, repeated actions, unknown action names) "
+            "over the same environment — this entry is the template, not the coverage. "
+            "The environment exposes a single fixed DGP and split; parameterized resets "
+            "(seed, split point as action arguments) are the natural extension but were "
+            "kept out to keep the verification battery exact. Observations are scalar "
+            "aggregates, so an agent cannot request diagnostics (residual plots, "
+            "subsample losses) — richer read-only inspection actions are future work."
+        ),
+    },
+    "agent_instructions": (
+        "1. Instantiate QuantEnvironment with the fixed seed; do not generate data "
+        "outside it. 2. Submit actions ONLY via env.step({'name': ...}); after every "
+        "step, parse the observation and branch on obs['ok'] — on False, read "
+        "obs['error'], do not retry blindly, and re-order the plan to satisfy the "
+        "stated precondition. 3. Drive the sequence to completion: reset, fit_train, "
+        "forecast_oos, evaluate_qlike, run_dm_test. 4. Log every (action, observation) "
+        "pair as a json trace line — the trace IS the research record. 5. Run the "
+        "verification battery: guard rejections counted, full sequence reached, json "
+        "round-trip, finite statistics, honest conclusion preserved, deterministic "
+        "replay on a fresh same-seed environment. 6. Emit verdict=ENVIRONMENT_VERIFIED "
+        "only if every check passes; any failure is ENVIRONMENT_BROKEN with the failing "
+        "check named. 7. Report the environment's statistical conclusion exactly as "
+        "observed (NO_SIGNIFICANT_EDGE) — the wrapper must never editorialize the "
+        "underlying result."
+    ),
+    "verification": {
+        "timeout_seconds": 120,
+        "must_print": [
+            "RESULTS",
+            "environment_class=QuantEnvironment",
+            "actions_executed=reset,fit_train,forecast_oos,evaluate_qlike,run_dm_test",
+            "guard_failures_handled=2",
+            "check_deterministic_replay=True",
+            "final_observation=",
+            "verdict=ENVIRONMENT_VERIFIED",
+        ],
+        "forbid_nan_in_stdout": True,
+        "required_packages": ["numpy", "scipy"],
+    },
+}
+
 ENTRIES = {
     "001_sma_crossover.json": migrate_v1_to_v2(
         ENTRY_SMA,
@@ -1079,6 +2225,9 @@ ENTRIES = {
             ],
         },
     ),
+    "004_adversarial_lookahead_sma.json": ENTRY_LOOKAHEAD,
+    "005_adversarial_p_hacking_sweep.json": ENTRY_PHACK,
+    "006_rlm_environment_garch.json": ENTRY_RLM,
 }
 
 

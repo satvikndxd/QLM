@@ -70,7 +70,7 @@
       "RESULTS",
       "annualized_sharpe_net=",
       "bootstrap_pvalue_sharpe_gt_0=",
-      "verdict="
+      "verdict=FAIL_TO_REJECT_H0"
     ],
     "forbid_nan_in_stdout": true,
     "required_packages": [

@@ -1,0 +1,109 @@
+{
+  "schema_version": 2,
+  "entry_kind": "adversarial",
+  "expected_verdict": "REJECTED_P_HACKING",
+  "flaws": [
+    {
+      "type": "p_hacking",
+      "severity": "fatal",
+      "location": "code_implementation:main (best-of-sweep selection and naive_p inference)",
+      "description": "The best configuration (SMA 15/120, Sharpe 0.86, 'p=0.008') was selected from 48 trials on a driftless random walk and its p-value computed as if it were the only test ever run; the expected MAX Sharpe over 48 null trials is ~0.57, so the winner is an order statistic of noise.",
+      "detection": "Apply a multiple-testing correction to the best observed statistic: compare it against the permutation null distribution of the grid-wide MAX Sharpe (simplified White reality check). Here the corrected p-value is ~0.19 vs a naive 0.008 — significance evaporates under the correct null.",
+      "corrective_action": "Report max-statistic-corrected p-values (or at minimum Bonferroni, here ~0.36) for any swept statistic, or confirm the selected configuration on a sealed holdout that played no role in selection before reporting it."
+    },
+    {
+      "type": "multiple_testing_abuse",
+      "severity": "high",
+      "location": "research_corpus:data_engineering (grid design)",
+      "description": "The 6x8 grid contains heavily overlapping configurations (correlated strategies), which makes the naive 'winner looks stable across neighbors' defense misleading: neighboring cells share most of their trades, so an apparent plateau of good Sharpes is one lucky draw seen 48 times, not 48 confirmations.",
+      "detection": "Compute the correlation matrix of the 48 strategy return streams; mean pairwise correlations far above zero mean the effective number of independent trials is far below 48, and 'neighborhood stability' arguments must be discarded in favor of the max-statistic null, which handles the correlation automatically.",
+      "corrective_action": "Always use a correction that preserves the dependence structure (permutation/bootstrap of the full grid) rather than treating grid cells as independent evidence; never argue significance from parameter-plateau smoothness alone."
+    }
+  ],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "strategy_sharpes",
+        "reason": "loop over 48 strategy configurations (not over time/rows); each config's backtest is fully vectorized",
+        "max_iterations": 48
+      },
+      {
+        "function": "max_stat_permutation",
+        "reason": "each permutation draw must be generated and evaluated independently to build the null",
+        "max_iterations": 200
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "multi_turn_audit",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000005-adversarial-p-hacking-sweep",
+    "domain": "Parameter Selection / Multiple Testing",
+    "complexity": 7,
+    "tags": [
+      "adversarial",
+      "p-hacking",
+      "multiple-testing",
+      "reality-check",
+      "max-statistic",
+      "block-permutation",
+      "parameter-sweep",
+      "order-statistics"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "A researcher swept 48 SMA configurations, found one with Sharpe 0.86 and p=0.008, and wants to trade it. The audit question is not 'is 0.86 good?' but 'good compared to WHAT null?'. Selecting the maximum of 48 correlated trials changes the null distribution from 'one strategy's Sharpe' to 'the maximum of 48 strategies' Sharpes' — and on pure noise that maximum averages ~0.57. The audit must rebuild the correct null with the selection step INSIDE it.",
+    "tool_selection": "Python REPL with numpy for the vectorized grid backtests and the block-permutation engine, scipy.stats for the naive normal p-value (kept only as the exhibit of the flaw). No statsmodels needed — the permutation test builds its own null.",
+    "recursive_delegation": "The 200 permutation draws are embarrassingly parallel: delegate shards of draws to sub-agents, each returning its vector of null max-Sharpes. The parent MUST own the selection step and the final quantile computation — delegating 'find the best config' to one agent and 'test it' to another without sharing the trial count is exactly how p-hacking happens organizationally."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "Naive claim: the best swept configuration (SMA 15/120) has true Sharpe > 0 (naive one-sided p=0.008 from SR*sqrt(T_years) ~ N(0,1)). Audit hypotheses — H0: all 48 configurations have zero true edge and the observed best is the expected order statistic of noise; H1: the best configuration's edge exceeds what maximal selection from 48 correlated null trials produces. Test: p_corrected = (1 + #{max-null draws >= observed best}) / (B+1) under a moving-block permutation null (B=200, block 21), plus Bonferroni as a cheap upper-bound cross-check. Ground truth is H0 by construction (driftless walk).",
+    "data_engineering": "2016 days (8 years) of seeded DRIFTLESS log returns at 18% vol — the generator guarantees every strategy's true edge is exactly zero, so any 'discovery' is definitionally spurious and the audit's job is to say so. Grid: 6 fast x 8 slow = 48 configurations. Every individual backtest is honest (one-bar lag, 2 bps turnover costs, warm-up flat): the flaw is planted exclusively in the inference-after-selection step, which is what makes this entry seductive — reading any single backtest reveals nothing wrong.",
+    "methodology_justification": "The max-statistic permutation test (simplified White 2000 reality check) is the appropriate correction because it (a) uses the null distribution of the SELECTED statistic — the grid maximum — rather than a single strategy's, and (b) preserves the correlation structure across the 48 strategies automatically, since each permutation re-runs the entire grid on the same resampled path. Bonferroni is reported alongside as the assumption-free upper bound: it over-corrects under correlation, so agreement between both (neither significant) is decisive. Block permutation (block 21) rather than IID shuffling preserves short-range dependence so the null is not artificially easy to beat.",
+    "code_implementation": "\"\"\"ADVERSARIAL TEACHING ENTRY: p-hacking via uncorrected parameter sweep.\n\nPedagogical arc: plausible strategy family -> attractive best-in-sweep\nresult (\"Sharpe 0.86, significant at 1%!\") -> adversarial audit via a\nmax-statistic block-permutation test (simplified White reality check)\n-> flaw detected -> corrected conclusion.\n\nGround truth is known by construction: prices are a DRIFTLESS seeded\nrandom walk, so no SMA configuration has any true edge. The sweep still\n\"finds\" one — that is the lesson. Deterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nfrom scipy import stats\n\nRNG_SEED = 24\nN_DAYS = 2016              # 8 trading years\nANN_FACTOR = 252\nCOST_BPS = 2.0\nFAST_GRID = [5, 10, 15, 20, 25, 30]\nSLOW_GRID = [40, 60, 80, 100, 120, 140, 160, 180]\nN_PERM = 200               # permutation draws for the max-statistic null\nBLOCK = 21                 # block length preserves short-range dependence\nALPHA = 0.05\n\n\ndef simulate_log_returns(n: int, seed: int) -> np.ndarray:\n    \"\"\"Driftless log returns, 18% annualized vol: true edge = 0 for every\n    configuration, by construction.\"\"\"\n    rng = np.random.default_rng(seed)\n    sigma = 0.18 / np.sqrt(ANN_FACTOR)\n    return sigma * rng.standard_normal(n) - 0.5 * sigma**2\n\n\ndef rolling_means(prices: np.ndarray, windows: list) -> dict:\n    \"\"\"O(n) rolling means via cumulative sums (vectorized; no pandas row\n    loops). Warm-up cells hold +inf sentinels internally so warm-up\n    comparisons are False; sentinels never reach stdout.\"\"\"\n    out = {}\n    c = np.concatenate([[0.0], np.cumsum(prices)])\n    for w in windows:\n        m = np.full(len(prices), np.inf)\n        m[w - 1:] = (c[w:] - c[:-w]) / w\n        out[w] = m\n    return out\n\n\ndef strategy_sharpes(prices: np.ndarray, cost_bps: float) -> np.ndarray:\n    \"\"\"Annualized net Sharpe for every (fast, slow) configuration.\n\n    Every backtest here is individually HONEST: one-bar execution lag,\n    turnover costs. The planted flaw is not in the backtests — it is in\n    what is done with 48 of them afterwards.\n    \"\"\"\n    n = len(prices)\n    rets = np.empty(n)\n    rets[0] = 0.0\n    rets[1:] = prices[1:] / prices[:-1] - 1.0\n    smas = rolling_means(prices, sorted(set(FAST_GRID + SLOW_GRID)))\n    sharpes = np.empty(len(FAST_GRID) * len(SLOW_GRID))\n    k = 0\n    for f in FAST_GRID:                # loop over configurations, not rows\n        for s in SLOW_GRID:\n            sig = (smas[f] > smas[s]).astype(float)\n            sig[: s - 1] = 0.0         # flat during warm-up\n            pos = np.empty(n)\n            pos[0] = 0.0\n            pos[1:] = sig[:-1]         # honest one-bar execution lag\n            net = pos * rets - np.abs(np.diff(pos, prepend=0.0)) * cost_bps / 1e4\n            sd = net.std(ddof=1)\n            sharpes[k] = 0.0 if sd == 0 else net.mean() / sd * np.sqrt(ANN_FACTOR)\n            k += 1\n    return sharpes\n\n\ndef block_permute(log_rets: np.ndarray, rng: np.random.Generator, block: int) -> np.ndarray:\n    \"\"\"Circular-style moving-block resample: destroys any (spurious)\n    signal-return alignment while preserving local dependence.\"\"\"\n    n = len(log_rets)\n    n_blocks = int(np.ceil(n / block))\n    starts = rng.integers(0, n - block + 1, size=n_blocks)\n    idx = (starts[:, None] + np.arange(block)[None, :]).ravel()[:n]\n    return log_rets[idx]\n\n\ndef max_stat_permutation(log_rets: np.ndarray, observed_best: float,\n                         n_perm: int, seed: int) -> tuple:\n    \"\"\"Simplified White reality check: the null distribution of the MAX\n    Sharpe across the whole grid, not of a single strategy's Sharpe.\n\n    THE key audit idea: 'best of 48' must be compared against 'best of\n    48 under the null', never against 'one strategy under the null'.\n    \"\"\"\n    rng = np.random.default_rng(seed)\n    max_null = np.empty(n_perm)\n    for b in range(n_perm):            # each permutation draw is independent\n        perm = block_permute(log_rets, rng, BLOCK)\n        p_prices = 100.0 * np.exp(np.cumsum(perm))\n        max_null[b] = strategy_sharpes(p_prices, COST_BPS).max()\n    p_corrected = float((1.0 + (max_null >= observed_best).sum()) / (n_perm + 1.0))\n    return p_corrected, float(max_null.mean())\n\n\ndef main() -> None:\n    log_rets = simulate_log_returns(N_DAYS, RNG_SEED)\n    prices = 100.0 * np.exp(np.cumsum(log_rets))\n\n    # --- The seductive naive procedure (flawed) ----------------------\n    sharpes = strategy_sharpes(prices, COST_BPS)\n    n_tested = len(sharpes)\n    best_idx = int(sharpes.argmax())\n    best_sharpe = float(sharpes.max())\n    best_fast = FAST_GRID[best_idx // len(SLOW_GRID)]\n    best_slow = SLOW_GRID[best_idx % len(SLOW_GRID)]\n    # Naive inference treats the winner as if it were the only test run:\n    t_stat = best_sharpe * np.sqrt(N_DAYS / ANN_FACTOR)\n    naive_p = float(1.0 - stats.norm.cdf(t_stat))\n\n    # --- Adversarial audit -------------------------------------------\n    # Correction 1 (cheap): Bonferroni on the naive p-value.\n    bonferroni_p = float(min(1.0, n_tested * naive_p))\n    # Correction 2 (proper): max-statistic permutation null.\n    corrected_p, null_max_mean = max_stat_permutation(\n        log_rets, best_sharpe, N_PERM, RNG_SEED + 1\n    )\n\n    hacked = naive_p < ALPHA and corrected_p >= ALPHA\n    audit_verdict = \"REJECTED_P_HACKING\" if hacked else (\n        \"SELECTION_SURVIVES_CORRECTION\" if corrected_p < ALPHA else \"NO_NAIVE_SIGNIFICANCE\"\n    )\n\n    print(\"RESULTS\")\n    print(f\"n_parameters_tested={n_tested}\")\n    print(f\"best_config=sma_{best_fast}_{best_slow}\")\n    print(f\"best_naive_sharpe={best_sharpe:.3f}\")\n    print(f\"naive_pvalue={naive_p:.5f}\")\n    print(f\"bonferroni_pvalue={bonferroni_p:.5f}\")\n    print(f\"corrected_pvalue={corrected_p:.5f}\")\n    print(f\"null_max_sharpe_mean={null_max_mean:.3f}\")\n    print(\"flaw_type=P_HACKING\")\n    print(f\"audit_verdict={audit_verdict}\")\n    # Corrected conclusion: on a driftless random walk the expected max\n    # Sharpe over 48 trials is ~0.57 — the \"discovery\" is the order\n    # statistic of noise, exactly as the permutation null predicts.\n    print(f\"verdict={audit_verdict}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at seed 24: best_naive_sharpe ~0.86 (config sma_15_120), naive_pvalue ~0.008 (looks significant at 1%), bonferroni_pvalue ~0.36, corrected_pvalue ~0.19, null_max_sharpe_mean ~0.57. The audit verdict requires the conjunction naive_p < 0.05 AND corrected_p >= 0.05 — i.e. the entry certifies specifically that naive inference and corrected inference disagree, which is the operational definition of p-hacking. Cross-seed behavior (21-28): naive p is 'significant' in 5 of 8 seeds while corrected p is never below 0.05 — the naive procedure's false-discovery rate is the lesson.",
+    "risk_and_backtest_audit": "Deploying the swept winner realizes zero expected edge minus costs: the certain outcome is negative carry with Sharpe ~0, sized as if it were 0.86 — and because the selection favored configurations that fit one path's noise, realized performance typically disappoints even the corrected estimate (regression to the mean past zero after costs). Institutional audit protocol: every reported statistic must carry its trial count n_parameters_tested; any research note quoting a swept result without it is returned unread; holdout windows are sealed BEFORE the sweep is designed, and one holdout look is budgeted per project, not per configuration."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The seduction is structural: every individual backtest in the sweep is clean, so no code review of any single cell finds the flaw — it exists only at the level of the procedure. (2) The naive defense 'neighboring parameters also look good' is invalid under correlation: overlapping SMA configs share trades, so a plateau is one lucky draw echoed 48 times. (3) 200 permutations bound the corrected p-value at ~0.005 resolution; claiming corrected significance near that floor requires more draws. (4) Bonferroni over-corrects under correlation and can be waved away by a motivated researcher — which is why the permutation test, not Bonferroni, must carry the verdict. (5) The same flaw recurs disguised as 'walk-forward optimization' when the walk-forward scheme itself was tuned across many variants.",
+    "falsification_strategy": "Attempt to rescue the discovery: (a) plant a REAL edge (add 4%/yr drift so trend rules genuinely help) and verify the same pipeline then yields corrected_p < 0.05 — confirming the audit has power and is not a machine that rejects everything; (b) shrink the grid to the single pre-registered config sma_15_120 and rerun on 100 fresh seeds — its Sharpe distribution centers on zero, directly falsifying the claim the sweep 'found' something; (c) double N_PERM and confirm corrected_p is stable (~0.19), ruling out permutation-count artifacts.",
+    "limitations": "The permutation null assumes block-stationarity; genuine long-memory structure beyond 21-day blocks would be partially destroyed, slightly cheapening the null. The simplified reality check tests only the single best configuration, not the full stepdown family (Romano-Wolf) needed to certify multiple survivors. The naive p-value's normal approximation for Sharpe ignores skew/kurtosis corrections (Lo 2002) — immaterial here since the audit rejects regardless, but material when verdicts are borderline. Conclusions transfer to real data only after adding the corrections this entry deliberately omits from the naive path."
+  },
+  "agent_instructions": "1. Reproduce the sweep exactly: 48 configs, honest per-config backtests, record every Sharpe — never only the winner. 2. Record n_parameters_tested BEFORE any selection; this number is part of the result, not metadata. 3. Compute the naive p-value for the best config and label it explicitly as pre-correction. 4. Run the max-statistic block-permutation null (>=200 draws): re-run the FULL grid per draw and take the max. 5. Compute corrected_p with the +1 finite-sample adjustment; cross-check with Bonferroni. 6. Verdict rule: naive_p < 0.05 AND corrected_p >= 0.05 => REJECTED_P_HACKING; report the corrected number first. 7. Power check: rerun the pipeline on a drifted DGP and confirm it CAN pass a real edge — an audit that rejects everything is as useless as one that rejects nothing. 8. In the final report, show the null-max distribution mean (~0.57) next to the 'discovery' (0.86) so the order-statistic nature of the result is visible at a glance.",
+  "verification": {
+    "timeout_seconds": 240,
+    "must_print": [
+      "RESULTS",
+      "n_parameters_tested=48",
+      "best_naive_sharpe=",
+      "naive_pvalue=",
+      "corrected_pvalue=",
+      "flaw_type=P_HACKING",
+      "audit_verdict=REJECTED_P_HACKING",
+      "verdict=REJECTED_P_HACKING"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "scipy"
+    ]
+  }
+}
