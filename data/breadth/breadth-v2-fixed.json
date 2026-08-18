@@ -1,0 +1,552 @@
+[
+  {
+    "id": "breadth-v2-0001",
+    "source": "qwen3.8-max",
+    "domain": "long_context",
+    "task_type": "trace",
+    "difficulty": 4,
+    "tags": [
+      "distributed-systems",
+      "cache-invalidation",
+      "variable-tracing"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Read the following technical specification and answer the question at the end.\n\nDISTRIBUTED CACHE INVALIDATION PROTOCOL v3.2\n\nSection 1: Overview. The Meridian cache layer uses a three-tier invalidation strategy. Tier 1 handles local node caches with a TTL of 30 seconds. Tier 2 manages regional cluster caches with event-driven invalidation. Tier 3 coordinates global cache coherence through a gossip protocol. The invalidation cascade begins when a write operation commits to the primary database. The write-ahead log (WAL) emits a change event with sequence number S. This sequence number propagates through all three tiers and is the critical ordering guarantee.\n\nSection 2: Tier 1 Local Invalidation. When a node receives a write notification, it checks its local cache registry. The registry maps cache keys to version vectors. If the incoming sequence number S exceeds the cached version vector entry V[k] for key k, the entry is evicted immediately. The eviction triggers a backfill request to Tier 2. The backfill request includes the original sequence number S so that Tier 2 can verify freshness before responding. If the backfill response carries a sequence number S2 less than S, the local node must discard the response and retry with exponential backoff starting at 50ms. The maximum retry count is 5. After 5 failed retries, the node marks the key as stale-frozen and stops serving reads for that key until a manual operator intervention resets the frozen flag.\n\nSection 3: Tier 2 Regional Invalidation. Regional clusters receive WAL events through a Kafka topic named meridian.wal.events. Each partition is keyed by the hash of the entity ID. The consumer group meridian-regional-cache maintains offsets per partition. When a consumer reads an event with sequence number S, it broadcasts an invalidation message to all nodes in the region via UDP multicast on port 9442. The invalidation message contains the entity ID, the new sequence number S, and a monotonic timestamp T. Nodes that receive the multicast message compare S against their local version vector. If S is greater, they evict and backfill. If S is less than or equal to the local version, the message is silently dropped. This idempotent drop behavior prevents thundering herd on replayed WAL segments.\n\nSection 4: Tier 3 Global Coherence. The gossip protocol runs every 500ms. Each node selects 3 random peers and exchanges anti-entropy digests. The digest is a Merkle tree over the version vector space. If a peer detects a divergence in the Merkle root, it initiates a repair session. The repair session transfers the missing version vector entries. During repair, the repairing node sets a lock flag L=1 on the affected key range. Reads to locked ranges are served from Tier 2 with a staleness annotation. The lock is released when the Merkle roots converge. The convergence threshold is a root hash match across at least 95 percent of nodes in the cluster.\n\nSection 5: Failure Modes. If the WAL emitter stalls for more than 10 seconds, a heartbeat timeout triggers. The heartbeat timeout causes all Tier 2 consumers to pause consumption and emit a WARN-level metric called wal_stall_detected. If the stall persists for 60 seconds, the system enters degraded mode. In degraded mode, Tier 1 TTL is extended from 30 seconds to 300 seconds to reduce backfill pressure. The degraded mode flag is stored in etcd under the key /meridian/config/degraded. Operators can clear degraded mode by deleting this etcd key, which triggers a rolling restart of all Tier 2 consumers.\n\nQuestion: A write commits with sequence number S=88231. The Tier 2 consumer broadcasts this to a node whose local version vector has V[k]=88229 for the affected key. The node evicts and sends a backfill to Tier 2. However, Tier 2 responds with sequence number S2=88225. What happens next, and what is the maximum total time the node will spend retrying before the key becomes stale-frozen?"
+      },
+      {
+        "role": "assistant",
+        "content": "Step 1: The node receives S=88231 and compares it to V[k]=88229. Since 88231 > 88229, the node evicts the cached entry (Section 2).\n\nStep 2: The node sends a backfill request to Tier 2 including S=88231.\n\nStep 3: Tier 2 responds with S2=88225. The node checks whether S2 < S. Since 88225 < 88231, the response is stale. Per Section 2, the node discards the response and retries with exponential backoff starting at 50ms.\n\nStep 4: The retry schedule uses exponential backoff. With a base of 50ms and 5 maximum retries, the delays are: 50ms, 100ms, 200ms, 400ms, 800ms. The total maximum retry time is 50 + 100 + 200 + 400 + 800 = 1550ms (1.55 seconds).\n\nStep 5: After all 5 retries are exhausted without receiving a response where S2 >= 88231, the node marks the key as stale-frozen. Per Section 2, it stops serving reads for that key until a manual operator intervention resets the frozen flag.\n\nAnswer: The node discards the stale backfill, retries up to 5 times with exponential backoff totaling a maximum of 1550ms, and then marks the key as stale-frozen, halting reads until manual operator reset."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0002",
+    "source": "qwen3.8-max",
+    "domain": "long_context",
+    "task_type": "retrieve",
+    "difficulty": 4,
+    "tags": [
+      "log-analysis",
+      "aggregation",
+      "needle-in-haystack"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Analyze the following server log excerpt and answer the question.\n\n2026-06-14T08:00:01Z INFO  auth-service login_success user_id=u1001 ip=10.0.1.5 latency_ms=42\n2026-06-14T08:00:02Z INFO  auth-service login_success user_id=u1002 ip=10.0.1.6 latency_ms=38\n2026-06-14T08:00:03Z WARN  auth-service rate_limit_hit user_id=u1003 ip=10.0.1.7 bucket=login_1m count=12\n2026-06-14T08:00:04Z INFO  auth-service login_success user_id=u1004 ip=10.0.1.8 latency_ms=51\n2026-06-14T08:00:05Z ERROR auth-service db_timeout user_id=u1005 ip=10.0.1.9 query=SELECT_SESSION timeout_ms=5000\n2026-06-14T08:00:06Z INFO  auth-service login_success user_id=u1006 ip=10.0.1.10 latency_ms=44\n2026-06-14T08:00:07Z INFO  payment-service charge_initiated user_id=u1001 amount=49.99 currency=USD txn_id=TXN-88001\n2026-06-14T08:00:08Z INFO  payment-service charge_success user_id=u1001 txn_id=TXN-88001 processor_latency_ms=210\n2026-06-14T08:00:09Z WARN  payment-service idempotency_key_reuse user_id=u1007 txn_id=TXN-88002 key=IDEM-4471\n2026-06-14T08:00:10Z ERROR payment-service charge_declined user_id=u1008 txn_id=TXN-88003 reason=insufficient_funds\n2026-06-14T08:00:11Z INFO  auth-service login_success user_id=u1009 ip=10.0.1.11 latency_ms=39\n2026-06-14T08:00:12Z INFO  auth-service login_success user_id=u1010 ip=10.0.1.12 latency_ms=47\n2026-06-14T08:00:13Z WARN  auth-service rate_limit_hit user_id=u1011 ip=10.0.1.13 bucket=login_1m count=15\n2026-06-14T08:00:14Z INFO  inventory-service stock_check sku=SKU-2201 warehouse=W3 quantity_available=142\n2026-06-14T08:00:15Z INFO  inventory-service stock_check sku=SKU-2202 warehouse=W3 quantity_available=0\n2026-06-14T08:00:16Z ERROR inventory-service stock_sync_failed sku=SKU-2203 warehouse=W5 error=connection_reset retry_count=3\n2026-06-14T08:00:17Z INFO  auth-service login_success user_id=u1012 ip=10.0.1.14 latency_ms=43\n2026-06-14T08:00:18Z INFO  payment-service charge_initiated user_id=u1009 amount=120.00 currency=EUR txn_id=TXN-88004\n2026-06-14T08:00:19Z INFO  payment-service charge_success user_id=u1009 txn_id=TXN-88004 processor_latency_ms=185\n2026-06-14T08:00:20Z WARN  payment-service currency_conversion_warning txn_id=TXN-88004 rate_source=fallback_spread_bps=120\n2026-06-14T08:00:21Z INFO  auth-service login_success user_id=u1013 ip=10.0.1.15 latency_ms=41\n2026-06-14T08:00:22Z ERROR auth-service token_validation_failed user_id=u1014 reason=expired_token age_seconds=7200\n2026-06-14T08:00:23Z INFO  inventory-service stock_replenish_triggered sku=SKU-2202 warehouse=W3 quantity_ordered=500\n2026-06-14T08:00:24Z INFO  auth-service login_success user_id=u1015 ip=10.0.1.16 latency_ms=40\n2026-06-14T08:00:25Z INFO  payment-service refund_initiated user_id=u1001 txn_id=TXN-88001 refund_id=REF-33001 amount=49.99\n2026-06-14T08:00:26Z INFO  payment-service refund_success user_id=u1001 refund_id=REF-33001 processor_latency_ms=95\n2026-06-14T08:00:27Z WARN  auth-service suspicious_login_pattern user_id=u1016 ip=10.0.9.99 country_mismatch=true previous_country=DE current_country=BR\n2026-06-14T08:00:28Z INFO  inventory-service stock_check sku=SKU-2204 warehouse=W1 quantity_available=87\n2026-06-14T08:00:29Z ERROR payment-service processor_circuit_open txn_id=TXN-88005 processor=stripe_http status=503\n2026-06-14T08:00:30Z INFO  auth-service login_success user_id=u1017 ip=10.0.1.17 latency_ms=45\n\nQuestion: Across all payment-service log lines, how many distinct user_ids initiated a charge, and what is the total amount successfully charged across all currencies? Also identify any transaction that was both initiated and later refunded, and state the refund amount."
+      },
+      {
+        "role": "assistant",
+        "content": "Step 1: Identify all payment-service charge_initiated events.\n- Line 7: user_id=u1001, amount=49.99, txn_id=TXN-88001\n- Line 18: user_id=u1009, amount=120.00, txn_id=TXN-88004\nTotal distinct user_ids that initiated a charge: 2 (u1001 and u1009).\n\nStep 2: Identify all payment-service charge_success events to determine successful charges.\n- Line 8: txn_id=TXN-88001 (user u1001) -> success\n- Line 19: txn_id=TXN-88004 (user u1009) -> success\nTXN-88002 had an idempotency warning (line 9) but no success line. TXN-88003 was declined (line 10). TXN-88005 hit a circuit open error (line 29). So only TXN-88001 and TXN-88004 succeeded.\nTotal successfully charged: 49.99 USD + 120.00 EUR. Since these are different currencies, the total per currency is 49.99 USD and 120.00 EUR.\n\nStep 3: Identify refunds.\n- Line 25: refund_initiated for user_id=u1001, txn_id=TXN-88001, refund_id=REF-33001, amount=49.99\n- Line 26: refund_success for refund_id=REF-33001\nTXN-88001 was both initiated (line 7) and refunded (line 25). The refund amount is 49.99.\n\nAnswer: 2 distinct user_ids initiated charges (u1001, u1009). Successfully charged amounts: 49.99 USD and 120.00 EUR. Transaction TXN-88001 was initiated and later refunded for 49.99."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0003",
+    "source": "qwen3.8-max",
+    "domain": "long_context",
+    "task_type": "retrieve",
+    "difficulty": 5,
+    "tags": [
+      "contract-analysis",
+      "conditional-clauses",
+      "legal-reasoning"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Review the following contract excerpt and answer the question.\n\nMASTER SERVICE AGREEMENT - EXCERPT\n\nSection 4: Service Level Commitments. 4.1 Provider shall maintain a Monthly Uptime Percentage of at least 99.9 percent for all Production Services. Monthly Uptime Percentage is calculated as the total minutes in a calendar month minus Downtime, divided by total minutes in the month, multiplied by 100. Downtime excludes Scheduled Maintenance Windows, which must be announced at least 72 hours in advance and must not exceed 4 hours per calendar month. 4.2 In the event that Monthly Uptime Percentage falls below 99.9 percent but remains at or above 99.0 percent, Client shall be entitled to a service credit equal to 5 percent of the monthly fee. 4.3 If Monthly Uptime Percentage falls below 99.0 percent but remains at or above 95.0 percent, the service credit shall be 15 percent of the monthly fee. 4.4 If Monthly Uptime Percentage falls below 95.0 percent, Client may, at its sole discretion, either receive a 30 percent service credit or terminate this Agreement with 30 days written notice, without penalty.\n\nSection 7: Data Protection. 7.1 Provider shall encrypt all Client Data at rest using AES-256 or equivalent. 7.2 Provider shall encrypt all Client Data in transit using TLS 1.2 or higher. 7.3 In the event of a Data Breach affecting more than 1000 records, Provider must notify Client within 24 hours of discovery. 7.4 If a Data Breach affects fewer than 1000 records, notification must occur within 72 hours. 7.5 Provider shall maintain cyber liability insurance with a minimum coverage of 5 million dollars per incident. 7.6 Failure to maintain the insurance coverage specified in 7.5 for more than 15 consecutive days constitutes a material breach, entitling Client to immediate termination without cure period.\n\nSection 12: Limitation of Liability. 12.1 Except for breaches of Section 7 (Data Protection) or Section 9 (Confidentiality), neither party's total aggregate liability shall exceed the total fees paid in the 12 months preceding the claim. 12.2 Notwithstanding Section 12.1, Provider's liability for a Data Breach caused by Provider's gross negligence shall not be capped and shall include all direct damages, reasonable forensic investigation costs, and regulatory fines imposed on Client as a direct result of the breach. 12.3 In no event shall either party be liable for indirect, incidental, or consequential damages, except where such damages arise from a breach of Section 7.\n\nSection 15: Termination. 15.1 Either party may terminate this Agreement for convenience with 90 days written notice. 15.2 Client may terminate immediately upon a material breach by Provider if such breach remains uncured for 30 days after written notice, except as provided in Section 7.6 where no cure period applies. 15.3 Upon termination, Provider shall return all Client Data in a mutually agreed format within 45 days and shall certify destruction of all copies within 60 days.\n\nQuestion: A Data Breach affects 2,500 records due to Provider's gross negligence. Provider's cyber liability insurance expired 20 days ago and has not been renewed. Client's monthly fee is 50,000 dollars, and total fees paid in the last 12 months were 600,000 dollars. What are Client's rights regarding notification timeline, liability cap, service credits, and termination? Address each separately and cite the relevant sections."
+      },
+      {
+        "role": "assistant",
+        "content": "Notification Timeline: Per Section 7.3, since the breach affects more than 1000 records (2,500), Provider must notify Client within 24 hours of discovery.\n\nLiability Cap: Per Section 12.1, the general liability cap is 600,000 dollars (12 months of fees). However, Section 12.2 creates an exception: because the breach was caused by Provider's gross negligence, Provider's liability is NOT capped. It includes all direct damages, reasonable forensic investigation costs, and regulatory fines imposed on Client. Additionally, Section 12.3 confirms that consequential damages are recoverable here because they arise from a breach of Section 7.\n\nService Credits: Service credits under Section 4 relate to Monthly Uptime Percentage, not data breaches. The scenario does not mention any downtime, so Sections 4.2-4.4 do not apply. Client's remedy for the breach is governed by Sections 7 and 12, not Section 4.\n\nTermination: Two independent termination rights apply.\n1. Section 7.6: Provider failed to maintain required cyber liability insurance for more than 15 consecutive days (20 days). This constitutes a material breach entitling Client to immediate termination without a cure period.\n2. Section 15.2: For other material breaches, Client must give 30 days cure notice. But since Section 7.6 explicitly removes the cure period, Client can terminate immediately.\n3. Additionally, Section 15.1 allows termination for convenience with 90 days notice, but this is unnecessary given the immediate termination right under 7.6.\n\nAnswer: Client must be notified within 24 hours (7.3). Liability is uncapped due to gross negligence (12.2), overriding the 600,000 dollar cap (12.1). Service credits do not apply to data breaches. Client may terminate immediately without cure period due to the 20-day insurance lapse (7.6, 15.2)."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0004",
+    "source": "qwen3.8-max",
+    "domain": "long_context",
+    "task_type": "trace",
+    "difficulty": 4,
+    "tags": [
+      "research-paper",
+      "multi-hop",
+      "methodology-tracing"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Read the following research methodology excerpt and answer the question.\n\nEXCERPT FROM METHODS SECTION\n\nWe conducted a multi-stage evaluation of the proposed routing algorithm across three network topologies: fat-tree, dragonfly, and torus. The evaluation proceeded in four phases.\n\nPhase 1: Baseline Characterization. We measured the baseline throughput and latency for each topology using uniform random traffic. For fat-tree, we used a 3-stage Clos network with 64 leaf switches, each hosting 8 compute nodes, yielding 512 total nodes. The oversubscription ratio was set to 2:1 at the spine layer. For dragonfly, we configured 16 groups of 8 routers each, with 4 local links per router and 2 global links per group. The torus topology used a 3D configuration of 8x8x8, also yielding 512 nodes. Baseline measurements were collected over 1000 seconds with a Poisson arrival process at lambda=0.8.\n\nPhase 2: Congestion Stress Testing. We introduced hotspot traffic by directing 40 percent of all packets to a single randomly selected destination node. This was repeated across 50 random destination selections per topology. We measured tail latency (p99) and packet loss. The congestion control mechanism was ECN-based with a marking threshold of 32 packets per queue. We observed that fat-tree exhibited the highest p99 latency under hotspot conditions due to the 2:1 oversubscription creating bottlenecks at the spine layer. Dragonfly showed moderate degradation because global links could reroute around local congestion. Torus showed the most graceful degradation due to its multiple shortest-path alternatives.\n\nPhase 3: Adaptive Routing Evaluation. We enabled the proposed adaptive routing algorithm and repeated the hotspot stress test. The algorithm uses a congestion-aware least-loaded path selection with a probe interval of 10ms. We compared against two existing adaptive schemes: Valiant routing and randomized shortest path. The proposed algorithm reduced p99 latency by 34 percent on fat-tree, 22 percent on dragonfly, and 11 percent on torus compared to the best existing adaptive scheme. The improvement was largest on fat-tree because the oversubscription bottleneck created the most opportunity for congestion-aware rerouting.\n\nPhase 4: Failure Recovery. We simulated link failures by removing 5 percent of links uniformly at random in each topology. We measured the time to converge to a new stable routing state and the throughput during convergence. The proposed algorithm converged in 45ms on fat-tree, 62ms on dragonfly, and 38ms on torus. Throughput during convergence dropped by 12 percent on fat-tree, 8 percent on dragonfly, and 5 percent on torus. The torus recovered fastest because its regular structure allowed rapid recomputation of alternative paths.\n\nQuestion: Considering all four phases, which topology showed the greatest relative improvement from the adaptive routing algorithm, and which topology showed the best failure recovery? Explain the architectural reasons cited in the text for both outcomes."
+      },
+      {
+        "role": "assistant",
+        "content": "Greatest Relative Improvement from Adaptive Routing: Fat-tree.\n\nFrom Phase 3, the proposed algorithm reduced p99 latency by 34 percent on fat-tree, 22 percent on dragonfly, and 11 percent on torus compared to the best existing adaptive scheme. Fat-tree showed the largest improvement.\n\nArchitectural reason cited: The text states that the improvement was largest on fat-tree because the 2:1 oversubscription ratio at the spine layer created bottlenecks under hotspot conditions (Phase 2). These bottlenecks created the most opportunity for congestion-aware rerouting to find less-loaded alternative paths through the spine layer.\n\nBest Failure Recovery: Torus.\n\nFrom Phase 4, torus converged in 38ms (fastest), compared to 45ms for fat-tree and 62ms for dragonfly. Throughput during convergence dropped only 5 percent on torus, compared to 12 percent on fat-tree and 8 percent on dragonfly. Torus had both the fastest convergence and the smallest throughput drop.\n\nArchitectural reason cited: The text states that torus recovered fastest because its regular 3D 8x8x8 structure allowed rapid recomputation of alternative paths. The multiple shortest-path alternatives inherent in the torus topology (also noted in Phase 2 as providing graceful degradation under congestion) enabled the routing algorithm to quickly find valid detours around failed links.\n\nAnswer: Fat-tree showed the greatest relative improvement from adaptive routing (34 percent p99 reduction) due to its oversubscription bottleneck creating rerouting opportunities. Torus showed the best failure recovery (38ms convergence, 5 percent throughput drop) due to its regular structure enabling rapid alternative path computation."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0005",
+    "source": "qwen3.8-max",
+    "domain": "long_context",
+    "task_type": "trace",
+    "difficulty": 5,
+    "tags": [
+      "configuration-docs",
+      "dependency-tracing",
+      "system-config"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Read the following configuration documentation and answer the question.\n\nSERVICE DEPENDENCY AND CONFIGURATION MAP\n\nThe platform consists of 8 microservices with the following dependency graph and configuration parameters.\n\nService: api-gateway. Port: 8080. Depends on: auth-service, rate-limiter, request-router. Config: max_connections=10000, idle_timeout_s=120, tls_version=1.3. Health check: GET /healthz every 10s. If 3 consecutive failures, the gateway is removed from the load balancer pool. The gateway propagates a header X-Request-ID to all downstream services for distributed tracing.\n\nService: auth-service. Port: 8081. Depends on: user-store, token-cache. Config: token_ttl_s=3600, refresh_token_ttl_s=86400, max_login_attempts=5, lockout_duration_s=900. Health check: GET /healthz every 15s. The auth-service reads user credentials from user-store and issues JWTs. It caches active tokens in token-cache with a TTL equal to token_ttl_s. If token-cache is unavailable, auth-service falls back to validating tokens directly against user-store, which increases user-store load by approximately 3x.\n\nService: user-store. Port: 5432. Depends on: none (it is the primary PostgreSQL database). Config: max_connections=200, shared_buffers=4GB, effective_cache_size=12GB. Health check: TCP connect on port 5432 every 5s. The user-store handles all persistent user data. It is the single source of truth for user credentials, preferences, and audit logs.\n\nService: token-cache. Port: 6379. Depends on: none (it is a Redis instance). Config: maxmemory=2GB, eviction_policy=allkeys-lru, persistence=rdb_snapshot_60s. Health check: PING every 5s. If memory usage exceeds 90 percent, the eviction policy triggers and may evict active tokens, causing users to be logged out prematurely.\n\nService: rate-limiter. Port: 8082. Depends on: rate-store. Config: algorithm=sliding_window, window_size_s=60, default_limit=100. Health check: GET /healthz every 10s. The rate-limiter reads counters from rate-store. If rate-store is unavailable, the rate-limiter fails open (allows all requests) and logs a CRITICAL alert.\n\nService: rate-store. Port: 6380. Depends on: none (it is a separate Redis instance). Config: maxmemory=1GB, eviction_policy=noeviction, persistence=aof_every_1s. Health check: PING every 5s. The noeviction policy ensures rate counters are never silently dropped. If memory is full, write operations fail and the rate-limiter detects this as a store unavailability event.\n\nService: request-router. Port: 8083. Depends on: service-registry. Config: routing_strategy=weighted_round_robin, retry_limit=2, circuit_breaker_threshold=5. Health check: GET /healthz every 10s. The request-router queries the service-registry to discover available backend instances. If the service-registry is unreachable, the router uses its last known good routing table, which is cached for up to 300 seconds.\n\nService: service-registry. Port: 8500. Depends on: none (it is a Consul cluster). Config: replication_factor=3, session_ttl_s=30, deregister_critical_after_s=90. Health check: gossip protocol every 1s. The service-registry maintains the canonical list of healthy service instances. All services register themselves on startup and send heartbeats every 10 seconds. If a service misses 3 heartbeats, the registry marks it critical and deregisters it after 90 seconds.\n\nQuestion: If token-cache experiences a memory pressure event that causes eviction of active tokens, AND rate-store simultaneously reaches its memory limit, describe the full cascade of effects across all 8 services, including which services degrade, which fail open, and what the end-user experience would be."
+      },
+      {
+        "role": "assistant",
+        "content": "Step 1: Token-cache eviction event.\nToken-cache hits 90 percent memory. The allkeys-lru eviction policy triggers and evicts active tokens. Users whose tokens were evicted will be logged out prematurely because auth-service can no longer find their tokens in cache.\n\nStep 2: Auth-service fallback.\nWhen evicted users present their tokens, auth-service checks token-cache, finds no entry, and falls back to validating tokens directly against user-store. This increases user-store load by approximately 3x.\n\nStep 3: User-store load increase.\nUser-store (PostgreSQL) has max_connections=200. The 3x load increase from auth-service fallback may approach or exceed connection limits, causing increased query latency and potential connection exhaustion for other services that query user-store.\n\nStep 4: Rate-store memory full.\nRate-store uses noeviction policy. When memory is full, write operations fail. The rate-limiter detects this as store unavailability.\n\nStep 5: Rate-limiter fails open.\nPer its configuration, when rate-store is unavailable, the rate-limiter fails open and allows all requests. It logs a CRITICAL alert. This means no rate limiting is enforced.\n\nStep 6: Cascade to api-gateway.\nWith rate limiting disabled, the api-gateway receives unthrottled traffic. Combined with the increased auth-service latency (due to user-store fallback), the api-gateway's max_connections=10000 may become saturated. The idle_timeout_s=120 may cause connection queuing.\n\nStep 7: Request-router and service-registry.\nThe request-router continues to function normally since service-registry is unaffected. However, if auth-service or user-store health checks fail due to overload, the service-registry may mark them critical after 3 missed heartbeats (30 seconds) and deregister them after 90 seconds. This would cause the request-router to stop routing to those instances.\n\nStep 8: End-user experience.\n- Users with evicted tokens are unexpectedly logged out.\n- Re-authentication attempts hit the overloaded auth-service, causing slow login or login failures.\n- Rate limiting is disabled, so abusive traffic is not blocked.\n- Overall API latency increases significantly due to user-store overload.\n- If auth-service is deregistered, all authentication fails completely.\n\nAnswer: The cascade is: token-cache eviction -> auth-service falls back to user-store (3x load) -> user-store approaches connection limits -> rate-store fills -> rate-limiter fails open -> unthrottled traffic hits api-gateway -> potential auth-service deregistration after 90s -> complete authentication failure. End users experience unexpected logouts, slow or failed authentication, and degraded API performance."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0006",
+    "source": "qwen3.8-max",
+    "domain": "program_synthesis",
+    "task_type": "synthesize",
+    "difficulty": 4,
+    "tags": [
+      "pandas",
+      "data-cleaning",
+      "currency-parsing"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "I have a CSV with columns: transaction_id, timestamp, user_id, amount, currency. Problems: timestamps are sometimes missing or in mixed formats (ISO 8601 and epoch seconds), transaction_id has duplicates, amount is a string with currency symbols like '$1,234.56' or '€890,12', and some rows have NaN user_id. Write a Python function to clean this."
+      },
+      {
+        "role": "assistant",
+        "content": "import pandas as pd\nimport numpy as np\n\ndef clean_transactions(df: pd.DataFrame) -> pd.DataFrame:\n    # Edge case: empty dataframe\n    if df.empty:\n        return df\n\n    # 1. Deduplicate by transaction_id, keeping the first occurrence.\n    # Edge case: all rows are duplicates -> result has 1 row per unique ID.\n    df = df.drop_duplicates(subset='transaction_id', keep='first').copy()\n\n    # 2. Parse mixed-format timestamps.\n    # Try ISO 8601 first, then epoch seconds. Coerce failures to NaT.\n    def parse_ts(val):\n        if pd.isna(val):\n            return pd.NaT\n        val_str = str(val).strip()\n        # Edge case: pure numeric string likely epoch seconds\n        try:\n            epoch = float(val_str)\n            return pd.to_datetime(epoch, unit='s', utc=True)\n        except (ValueError, OverflowError):\n            pass\n        # Try ISO 8601\n        parsed = pd.to_datetime(val_str, errors='coerce', utc=True)\n        return parsed\n\n    df['timestamp'] = df['timestamp'].apply(parse_ts)\n\n    # 3. Drop rows where user_id is NaN.\n    # Edge case: all user_ids are NaN -> empty result.\n    df = df.dropna(subset=['user_id']).copy()\n\n    # 4. Parse amount strings with currency symbols and locale separators.\n    def parse_amount(raw, currency_code):\n        if pd.isna(raw):\n            return np.nan\n        s = str(raw).strip()\n        # Remove common currency symbols and whitespace\n        for sym in ['$', '€', '£', '¥', 'USD', 'EUR', 'GBP']:\n            s = s.replace(sym, '')\n        s = s.strip()\n        # Handle European format: 1.234,56 -> 1234.56\n        if ',' in s and '.' in s:\n            # If comma is after last dot, treat dot as thousands sep\n            if s.rfind(',') > s.rfind('.'):\n                s = s.replace('.', '').replace(',', '.')\n            else:\n                s = s.replace(',', '')\n        elif ',' in s:\n            # Ambiguous: if exactly 2 digits after comma, treat as decimal\n            parts = s.split(',')\n            if len(parts) == 2 and len(parts[1]) == 2:\n                s = s.replace(',', '.')\n            else:\n                s = s.replace(',', '')\n        try:\n            return float(s)\n        except ValueError:\n            return np.nan\n\n    df['amount'] = df.apply(\n        lambda r: parse_amount(r['amount'], r.get('currency', '')), axis=1\n    )\n\n    # 5. Drop rows where timestamp or amount could not be parsed.\n    df = df.dropna(subset=['timestamp', 'amount']).copy()\n\n    # 6. Sort by timestamp for downstream time-series use.\n    df = df.sort_values('timestamp').reset_index(drop=True)\n\n    return df\n\n# Edge case handled: mixed epoch/ISO timestamps, duplicate IDs,\n# NaN user_ids, locale-aware currency parsing, and empty input."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0007",
+    "source": "qwen3.8-max",
+    "domain": "program_synthesis",
+    "task_type": "synthesize",
+    "difficulty": 4,
+    "tags": [
+      "pandas",
+      "json-normalization",
+      "nested-data"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "I have a list of JSON log records with inconsistent schemas. Some have a nested 'error' object with 'code' and 'message', others have 'error_code' as a flat field, and some have no error info at all. The 'timestamp' field is sometimes 'ts', sometimes 'time', sometimes 'created_at'. Write a Python function to normalize these into a flat pandas DataFrame."
+      },
+      {
+        "role": "assistant",
+        "content": "import pandas as pd\nimport json\n\ndef normalize_logs(records: list) -> pd.DataFrame:\n    # Edge case: empty input\n    if not records:\n        return pd.DataFrame(columns=['timestamp', 'level', 'error_code', 'error_message', 'raw'])\n\n    rows = []\n    for rec in records:\n        # Handle both dict and JSON string inputs\n        if isinstance(rec, str):\n            try:\n                rec = json.loads(rec)\n            except json.JSONDecodeError:\n                continue  # Edge case: skip malformed JSON\n        if not isinstance(rec, dict):\n            continue\n\n        # 1. Normalize timestamp from multiple possible keys\n        ts = None\n        for key in ['timestamp', 'ts', 'time', 'created_at']:\n            if key in rec and rec[key] is not None:\n                ts = rec[key]\n                break\n\n        # 2. Normalize error info from nested or flat structures\n        error_code = None\n        error_message = None\n\n        if 'error' in rec and isinstance(rec['error'], dict):\n            error_code = rec['error'].get('code')\n            error_message = rec['error'].get('message')\n        elif 'error_code' in rec:\n            error_code = rec['error_code']\n            error_message = rec.get('error_message', rec.get('error_msg'))\n\n        # 3. Extract level with fallback\n        level = rec.get('level', rec.get('severity', 'INFO'))\n\n        rows.append({\n            'timestamp': ts,\n            'level': level,\n            'error_code': error_code,\n            'error_message': error_message,\n            'raw': json.dumps(rec, default=str)\n        })\n\n    df = pd.DataFrame(rows)\n\n    # 4. Parse timestamps, coercing failures to NaT\n    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=True)\n\n    # 5. Sort by timestamp, placing NaT at the end\n    df = df.sort_values('timestamp', na_position='last').reset_index(drop=True)\n\n    return df\n\n# Edge cases handled: missing keys, nested vs flat error objects,\n# malformed JSON strings, non-dict entries, and empty input list."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0008",
+    "source": "qwen3.8-max",
+    "domain": "program_synthesis",
+    "task_type": "synthesize",
+    "difficulty": 5,
+    "tags": [
+      "time-series",
+      "outlier-detection",
+      "timezone-handling"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "I have a sensor time series DataFrame with columns 'ts' (timezone-naive timestamps in mixed timezones), 'sensor_id', and 'value'. Problems: there are gaps of up to 6 hours, extreme outliers (values > 10x the median), duplicate timestamps per sensor, and some sensors report in Celsius while others report in Fahrenheit (indicated by a 'unit' column). Write a cleaning pipeline."
+      },
+      {
+        "role": "assistant",
+        "content": "import pandas as pd\nimport numpy as np\n\ndef clean_sensor_data(df: pd.DataFrame) -> pd.DataFrame:\n    if df.empty:\n        return df\n\n    df = df.copy()\n\n    # 1. Parse timestamps and assume UTC for naive timestamps.\n    # Edge case: if ts contains timezone-aware strings, utc=True normalizes them.\n    df['ts'] = pd.to_datetime(df['ts'], errors='coerce', utc=True)\n    df = df.dropna(subset=['ts'])\n\n    # 2. Deduplicate: for each sensor_id + ts, keep the median value.\n    # Edge case: duplicate timestamps with wildly different values.\n    df = df.groupby(['sensor_id', 'ts'], as_index=False).agg(\n        value=('value', 'median'),\n        unit=('unit', 'first')\n    )\n\n    # 3. Convert Fahrenheit to Celsius where needed.\n    # Edge case: unit column may have inconsistent casing.\n    df['unit'] = df['unit'].str.strip().str.upper()\n    fahrenheit_mask = df['unit'] == 'F'\n    df.loc[fahrenheit_mask, 'value'] = (\n        (df.loc[fahrenheit_mask, 'value'] - 32.0) * 5.0 / 9.0\n    )\n    df['unit'] = 'C'  # standardize\n\n    # 4. Remove outliers per sensor using median-based threshold.\n    # Edge case: sensors with very few readings; use groupby transform.\n    medians = df.groupby('sensor_id')['value'].transform('median')\n    threshold = 10.0 * medians.abs()\n    # Handle sensors where median is 0 to avoid zero threshold\n    threshold = threshold.clip(lower=1.0)\n    df = df[(df['value'].abs() <= threshold) | (medians == 0)]\n\n    # 5. Sort and reindex to fill gaps up to 6 hours.\n    # Edge case: sensors with irregular reporting intervals.\n    result_frames = []\n    for sid, grp in df.groupby('sensor_id'):\n        grp = grp.set_index('ts').sort_index()\n        full_range = pd.date_range(\n            start=grp.index.min(),\n            end=grp.index.max(),\n            freq='1min'  # assume 1-minute resolution\n        )\n        grp = grp.reindex(full_range)\n        # Only interpolate gaps up to 6 hours (360 minutes)\n        grp['value'] = grp['value'].interpolate(\n            method='time', limit=360, limit_area='inside'\n        )\n        grp['sensor_id'] = sid\n        grp['unit'] = 'C'\n        grp.index.name = 'ts'\n        result_frames.append(grp.reset_index())\n\n    if not result_frames:\n        return pd.DataFrame(columns=['ts', 'sensor_id', 'value', 'unit'])\n\n    result = pd.concat(result_frames, ignore_index=True)\n    return result\n\n# Edge cases: mixed timezones, duplicate timestamps resolved by median,\n# unit conversion, 10x median outlier removal, 6-hour gap interpolation cap."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0009",
+    "source": "qwen3.8-max",
+    "domain": "program_synthesis",
+    "task_type": "synthesize",
+    "difficulty": 4,
+    "tags": [
+      "referential-integrity",
+      "multi-file-join",
+      "data-validation"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "I have two DataFrames: 'orders' (order_id, customer_id, order_date, total) and 'customers' (customer_id, name, signup_date, is_active). Problems: some orders reference customer_ids that don't exist in customers, some customers have duplicate customer_ids with different names, and some order_dates are before the customer's signup_date. Write a validation and cleaning function."
+      },
+      {
+        "role": "assistant",
+        "content": "import pandas as pd\nimport numpy as np\n\ndef validate_and_clean(orders: pd.DataFrame, customers: pd.DataFrame) -> dict:\n    result = {\n        'clean_orders': pd.DataFrame(),\n        'orphaned_orders': pd.DataFrame(),\n        'impossible_dates': pd.DataFrame(),\n        'duplicate_customers': pd.DataFrame()\n    }\n\n    if orders.empty or customers.empty:\n        result['orphaned_orders'] = orders.copy()\n        return result\n\n    orders = orders.copy()\n    customers = customers.copy()\n\n    # 1. Identify duplicate customer_ids.\n    # Edge case: same customer_id with different names -> keep earliest signup.\n    dup_mask = customers.duplicated(subset='customer_id', keep=False)\n    result['duplicate_customers'] = customers[dup_mask].copy()\n    customers_dedup = customers.sort_values('signup_date').drop_duplicates(\n        subset='customer_id', keep='first'\n    )\n\n    # 2. Parse dates\n    orders['order_date'] = pd.to_datetime(orders['order_date'], errors='coerce')\n    customers_dedup['signup_date'] = pd.to_datetime(\n        customers_dedup['signup_date'], errors='coerce'\n    )\n\n    # 3. Find orphaned orders (customer_id not in customers)\n    valid_ids = set(customers_dedup['customer_id'])\n    orphan_mask = ~orders['customer_id'].isin(valid_ids)\n    result['orphaned_orders'] = orders[orphan_mask].copy()\n    orders_valid = orders[~orphan_mask].copy()\n\n    # 4. Find impossible dates (order before signup)\n    merged = orders_valid.merge(\n        customers_dedup[['customer_id', 'signup_date']],\n        on='customer_id', how='left'\n    )\n    impossible_mask = merged['order_date'] < merged['signup_date']\n    result['impossible_dates'] = merged[impossible_mask].copy()\n    clean_mask = ~impossible_mask & merged['order_date'].notna()\n    result['clean_orders'] = merged[clean_mask].drop(\n        columns=['signup_date']\n    ).copy()\n\n    return result\n\n# Edge cases: orphaned customer_ids resolved by exclusion,\n# duplicate customers resolved by earliest signup_date,\n# impossible dates flagged and excluded, NaT dates dropped."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0010",
+    "source": "qwen3.8-max",
+    "domain": "program_synthesis",
+    "task_type": "synthesize",
+    "difficulty": 3,
+    "tags": [
+      "text-cleaning",
+      "encoding",
+      "mixed-formats"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "I have a DataFrame with a 'description' column containing text with mixed encodings (some UTF-8, some Latin-1 artifacts), HTML tags, excessive whitespace, and inconsistent casing. Write a Python function to clean the text column."
+      },
+      {
+        "role": "assistant",
+        "content": "import pandas as pd\nimport re\nimport html\n\ndef clean_text_column(df: pd.DataFrame, col: str = 'description') -> pd.DataFrame:\n    if df.empty or col not in df.columns:\n        return df\n\n    df = df.copy()\n\n    def clean_single(text):\n        if pd.isna(text):\n            return ''\n\n        # 1. Handle encoding artifacts.\n        # Edge case: text may already be str but contain mojibake.\n        if isinstance(text, bytes):\n            try:\n                text = text.decode('utf-8')\n            except UnicodeDecodeError:\n                text = text.decode('latin-1', errors='replace')\n\n        # 2. Unescape HTML entities (&amp; -> &, etc.)\n        text = html.unescape(text)\n\n        # 3. Strip HTML tags.\n        text = re.sub(r'<[^>]+>', ' ', text)\n\n        # 4. Normalize whitespace: collapse multiple spaces/newlines.\n        text = re.sub(r'\\s+', ' ', text).strip()\n\n        # 5. Normalize casing: lowercase for consistency.\n        # Edge case: preserve acronyms if needed; here we lowercase all.\n        text = text.lower()\n\n        return text\n\n    df[col] = df[col].apply(clean_single)\n\n    # 6. Drop rows where description became empty after cleaning.\n    df = df[df[col] != ''].copy()\n\n    return df\n\n# Edge cases: bytes vs str input, Latin-1 fallback, HTML entity\n# unescaping before tag removal, whitespace collapse, empty result handling."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0011",
+    "source": "qwen3.8-max",
+    "domain": "agentic_planning",
+    "task_type": "plan",
+    "difficulty": 4,
+    "tags": [
+      "rest-api",
+      "rate-limiting",
+      "exponential-backoff"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Goal: Sync 500 user profiles from our internal database to an external CRM API. Available endpoints: GET /api/v1/users?page={n}&limit=50 (internal), POST /api/crm/contacts (external, rate limited to 10 req/min, returns 201 on success, 409 if contact exists, 429 if rate limited, 500 on server error). Plan the execution."
+      },
+      {
+        "role": "assistant",
+        "content": "Execution Plan:\n\nStep 1: Fetch all internal users.\n- Call GET /api/v1/users?page={n}&limit=50 for pages 1 through 10 (500 users / 50 per page).\n- Collect all user records into a list.\n- Handle pagination: stop when a page returns fewer than 50 records.\n\nStep 2: Transform each user record to the CRM contact schema.\n- Map fields: name -> full_name, email -> email_address, phone -> phone_number.\n- Skip records with missing email (required field in CRM).\n\nStep 3: Submit contacts to the CRM API with rate limiting.\n- Implement a token bucket or simple sleep of 6 seconds between requests (10 req/min = 1 req per 6s).\n- For each contact, call POST /api/crm/contacts with JSON payload:\n  {\"full_name\": \"...\", \"email_address\": \"...\", \"phone_number\": \"...\"}\n\nStep 4: Handle response codes.\n- 201: Log success, increment success counter.\n- 409: Contact already exists. Log as skipped, do not retry.\n- 429: Rate limited. Read Retry-After header if present. Otherwise, wait 60 seconds and retry the same request. Max 3 retries per request.\n- 500: Server error. Exponential backoff: wait 2s, 4s, 8s. Max 3 retries. After 3 failures, add to a dead-letter queue for manual review.\n- Network timeout: Treat as 500, same retry logic.\n\nStep 5: Report.\n- Log total: sent, created (201), skipped (409), failed after retries.\n- Write failed records to a JSON file for later reprocessing.\n\nError handling summary:\n- 429 -> wait Retry-After or 60s, retry up to 3x.\n- 500 -> exponential backoff 2/4/8s, retry up to 3x.\n- 409 -> skip, no retry.\n- 3 failed retries -> dead-letter queue."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0012",
+    "source": "qwen3.8-max",
+    "domain": "agentic_planning",
+    "task_type": "plan",
+    "difficulty": 4,
+    "tags": [
+      "pipeline-orchestration",
+      "python-tools",
+      "error-recovery"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Goal: Build a nightly data pipeline that extracts sales data from a PostgreSQL database, transforms it, and loads it into a Parquet file on S3. Available Python tools: run_sql(query) -> DataFrame, transform_sales(df) -> DataFrame, write_parquet(df, path), upload_to_s3(local_path, s3_key), send_alert(message). Plan the pipeline with error handling."
+      },
+      {
+        "role": "assistant",
+        "content": "Execution Plan:\n\nStep 1: Extract.\n- Call run_sql('SELECT order_id, product_id, quantity, unit_price, order_date FROM sales WHERE order_date >= CURRENT_DATE - INTERVAL 1 day').\n- Validate: if the returned DataFrame is empty, call send_alert('No sales data for the target date') and halt with a non-error exit code (expected on holidays).\n- If run_sql raises a connection error, retry up to 3 times with 10s delay. After 3 failures, call send_alert('Database connection failed') and exit with error code 1.\n\nStep 2: Transform.\n- Call transform_sales(df).\n- This function should: compute revenue = quantity * unit_price, parse order_date to datetime, deduplicate on order_id, and filter out negative quantities.\n- Validate: assert no NaN values in revenue column. If NaN found, log the count and drop those rows. If more than 5 percent of rows are dropped, call send_alert('High data quality issue: >5pct rows dropped').\n\nStep 3: Load to Parquet.\n- Generate local path: /tmp/sales_{YYYY-MM-DD}.parquet using the target date.\n- Call write_parquet(transformed_df, local_path).\n- Validate: check file exists and file size > 0. If file is missing or empty, call send_alert('Parquet write failed') and exit with error code 1.\n\nStep 4: Upload to S3.\n- S3 key: data/sales/year={YYYY}/month={MM}/day={DD}/sales.parquet\n- Call upload_to_s3(local_path, s3_key).\n- Retry logic: if upload fails, retry up to 3 times with exponential backoff (5s, 10s, 20s).\n- After 3 failures, call send_alert('S3 upload failed after 3 retries') and exit with error code 1.\n\nStep 5: Cleanup and success notification.\n- Delete the local Parquet file.\n- Log pipeline completion with row count and duration.\n- Optionally call send_alert('Pipeline completed successfully: {row_count} rows') for audit trail.\n\nFailure modes covered: DB connection failure, empty result, data quality issues, disk write failure, S3 upload failure with retries."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0013",
+    "source": "qwen3.8-max",
+    "domain": "agentic_planning",
+    "task_type": "plan",
+    "difficulty": 5,
+    "tags": [
+      "microservice-auth",
+      "retry-strategy",
+      "circuit-breaker"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Goal: Call a downstream microservice that requires OAuth2 client credentials authentication. The service endpoint is POST /api/v2/orders. It returns 200 on success, 401 if token expired, 403 if insufficient scope, 429 if rate limited, and 503 if the service is down. I have a token endpoint POST /auth/token that returns an access_token valid for 300 seconds. Plan the full interaction including authentication, retries, and circuit breaking."
+      },
+      {
+        "role": "assistant",
+        "content": "Execution Plan:\n\nStep 1: Obtain OAuth2 token.\n- Call POST /auth/token with payload:\n  {\"grant_type\": \"client_credentials\", \"client_id\": CLIENT_ID, \"client_secret\": CLIENT_SECRET}\n- Parse response to get access_token and expires_in (expected 300s).\n- Store token with an expiry timestamp = now + expires_in - 30s (30s safety margin).\n- If token request fails, retry up to 2 times with 5s delay. If still failing, abort and raise an authentication error.\n\nStep 2: Prepare the order request.\n- Construct the payload for POST /api/v2/orders.\n- Set headers: Authorization: Bearer {access_token}, Content-Type: application/json.\n\nStep 3: Implement circuit breaker state.\n- States: CLOSED (normal), OPEN (failing, do not call), HALF_OPEN (testing recovery).\n- Track consecutive failures. If failures >= 5 within 60 seconds, transition to OPEN.\n- In OPEN state, wait 30 seconds before transitioning to HALF_OPEN.\n- In HALF_OPEN, allow one test request. If it succeeds, transition to CLOSED. If it fails, transition back to OPEN.\n\nStep 4: Execute the request with retry logic.\n- Check circuit breaker state. If OPEN, skip the call and return a circuit-open error.\n- Call POST /api/v2/orders.\n- Handle responses:\n  - 200: Success. Reset circuit breaker failure count. Return response.\n  - 401: Token expired. Go back to Step 1 to refresh token, then retry the request once. If 401 again, abort.\n  - 403: Insufficient scope. Do NOT retry. This is a configuration error. Log and abort.\n  - 429: Rate limited. Read Retry-After header. Wait that duration (or 60s default), then retry. Max 3 retries.\n  - 503: Service down. Increment circuit breaker failure count. Exponential backoff: 1s, 2s, 4s. Max 3 retries. If all fail, circuit breaker may trip to OPEN.\n  - Network timeout: Treat as 503.\n\nStep 5: Post-execution.\n- Log the final outcome: success, retried_success, circuit_open, auth_failure, or rate_limited_exhausted.\n- If the circuit is OPEN, emit a metric for alerting.\n\nKey decisions:\n- 403 is never retried (permission issue, not transient).\n- 401 triggers exactly one token refresh, not infinite retries.\n- Circuit breaker prevents hammering a down service.\n- Token is proactively refreshed 30s before expiry to avoid mid-request expiration."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0014",
+    "source": "qwen3.8-max",
+    "domain": "agentic_planning",
+    "task_type": "plan",
+    "difficulty": 4,
+    "tags": [
+      "database-migration",
+      "rollback",
+      "schema-versioning"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Goal: Perform a zero-downtime database migration that adds a new column 'loyalty_tier' to the 'customers' table and backfills it based on the 'total_spend' column. The table has 50 million rows. Available tools: run_migration(sql), check_replication_lag(), create_index(sql), swap_tables(old, new), rollback(old, new). Plan the migration with rollback capability."
+      },
+      {
+        "role": "assistant",
+        "content": "Execution Plan:\n\nStep 1: Pre-flight checks.\n- Call check_replication_lag(). If lag > 5 seconds, abort and reschedule.\n- Verify sufficient disk space for a full table copy (estimate: 50M rows * avg row size * 1.5).\n- Take a logical backup or snapshot of the customers table.\n\nStep 2: Create the new table with the added column.\n- Call run_migration('CREATE TABLE customers_new AS SELECT *, NULL AS loyalty_tier FROM customers WHERE 1=0').\n- This creates the schema without copying data yet.\n- Call run_migration('ALTER TABLE customers_new ADD CONSTRAINT chk_tier CHECK (loyalty_tier IN (NULL, ''bronze'', ''silver'', ''gold''))').\n\nStep 3: Backfill in batches to avoid locking.\n- Process in batches of 100,000 rows using keyset pagination:\n  For each batch:\n  - INSERT INTO customers_new SELECT *, CASE WHEN total_spend > 10000 THEN 'gold' WHEN total_spend > 1000 THEN 'silver' ELSE 'bronze' END AS loyalty_tier FROM customers WHERE id > {last_id} ORDER BY id LIMIT 100000.\n  - Update last_id.\n  - Call check_replication_lag() every 10 batches. If lag > 10 seconds, pause for 30 seconds.\n- This avoids a single long-running transaction and allows replication to keep up.\n\nStep 4: Create indexes on the new table.\n- Call create_index('CREATE INDEX idx_loyalty_tier ON customers_new(loyalty_tier)').\n- Recreate all existing indexes from customers on customers_new.\n\nStep 5: Verify data integrity.\n- Compare row counts: SELECT COUNT(*) FROM customers vs customers_new.\n- Spot-check: sample 1000 random IDs and verify loyalty_tier is correctly computed.\n- Run check_replication_lag(). Ensure lag < 2 seconds before proceeding.\n\nStep 6: Swap tables (zero-downtime).\n- Begin a short transaction.\n- Call swap_tables('customers', 'customers_new'). This renames customers to customers_old and customers_new to customers.\n- Commit. The swap should take < 1 second.\n\nStep 7: Post-swap validation.\n- Run a canary query: SELECT loyalty_tier, COUNT(*) FROM customers GROUP BY loyalty_tier.\n- Monitor application error rates for 15 minutes.\n\nStep 8: Rollback plan.\n- If any post-swap validation fails, call rollback('customers', 'customers_old') to swap back.\n- Keep customers_old for 7 days before dropping.\n- If rollback is triggered, investigate the failure before re-attempting.\n\nKey decisions:\n- Batched backfill prevents table locks and replication lag.\n- Separate table + swap avoids ALTER TABLE on a 50M row table.\n- Rollback is a simple reverse swap, not a data restore."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0015",
+    "source": "qwen3.8-max",
+    "domain": "agentic_planning",
+    "task_type": "plan",
+    "difficulty": 5,
+    "tags": [
+      "cloud-deployment",
+      "health-checks",
+      "blue-green"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Goal: Deploy a new version of a web service using blue-green deployment on a cloud platform. Available tools: create_deployment(config), get_deployment_status(name), route_traffic(target), run_health_check(url), rollback_deployment(name), send_notification(msg). The service has 3 replicas and must maintain zero downtime. Plan the deployment."
+      },
+      {
+        "role": "assistant",
+        "content": "Execution Plan:\n\nStep 1: Pre-deployment validation.\n- Run the existing health check on the current (blue) deployment: run_health_check('https://api.example.com/healthz').\n- If the current deployment is unhealthy, abort and send_notification('Aborting: current deployment unhealthy').\n- Validate the new deployment config: check image tag, resource limits, env vars.\n\nStep 2: Create the green deployment.\n- Call create_deployment(config_v2) with the name 'service-green'.\n- Config: 3 replicas, readiness probe on /healthz, liveness probe on /healthz, initial delay 30s.\n- Do NOT route traffic to green yet.\n\nStep 3: Wait for green to become ready.\n- Poll get_deployment_status('service-green') every 5 seconds.\n- Wait until all 3 replicas report Ready.\n- Timeout: 300 seconds. If not ready within 300s, call rollback_deployment('service-green') and send_notification('Green deployment failed to become ready').\n\nStep 4: Run health checks on green directly.\n- Call run_health_check against the green deployment's internal endpoint (not the public route).\n- Run 5 consecutive health checks at 10-second intervals.\n- All 5 must pass. If any fail, rollback green and abort.\n\nStep 5: Shift traffic gradually.\n- Call route_traffic(target='service-green', percentage=10). Send 10 percent of traffic to green.\n- Monitor error rates for 60 seconds. If error rate > 1 percent, call route_traffic(target='service-blue', percentage=100) and rollback green.\n- If stable, call route_traffic(target='service-green', percentage=50). Monitor for 120 seconds.\n- If stable, call route_traffic(target='service-green', percentage=100).\n\nStep 6: Post-deployment monitoring.\n- Monitor for 10 minutes after 100 percent traffic shift.\n- Watch: error rate, p99 latency, pod restart count.\n- If any metric degrades beyond threshold, call route_traffic(target='service-blue', percentage=100) and rollback_deployment('service-green').\n\nStep 7: Decommission blue.\n- After 24 hours of stable operation, scale down 'service-blue' to 0 replicas.\n- Keep the blue deployment config for 7 days as a fast rollback target.\n\nStep 8: Notifications.\n- send_notification('Deployment v2 started') at Step 2.\n- send_notification('Traffic at 100pct on green') at Step 5 completion.\n- send_notification('Deployment v2 complete, blue decommissioned') at Step 7.\n\nKey decisions:\n- Gradual traffic shift (10/50/100) limits blast radius.\n- Blue is kept warm for 24 hours for instant rollback.\n- Health checks run before traffic shift to catch startup issues early."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0016",
+    "source": "qwen3.8-max",
+    "domain": "math_stats",
+    "task_type": "calculate",
+    "difficulty": 4,
+    "tags": [
+      "bayesian-updating",
+      "conditional-probability",
+      "base-rate"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "A disease has a prevalence of 0.5 percent. A test has 98 percent sensitivity and 95 percent specificity. A person tests positive twice in a row (two independent tests). What is the probability they actually have the disease after the second positive test?"
+      },
+      {
+        "role": "assistant",
+        "content": "Step 1: Define variables.\nPrevalence P(D) = 0.005, so P(not D) = 0.995.\nSensitivity P(+|D) = 0.98.\nSpecificity P(-|not D) = 0.95, so P(+|not D) = 0.05.\n\nStep 2: Apply Bayes theorem after the first positive test.\nP(D|+) = P(+|D) * P(D) / [P(+|D)*P(D) + P(+|not D)*P(not D)]\n= (0.98 * 0.005) / (0.98*0.005 + 0.05*0.995)\n= 0.0049 / (0.0049 + 0.04975)\n= 0.0049 / 0.05465\n= 0.08966 (about 8.97 percent).\n\nStep 3: Use the posterior from test 1 as the prior for test 2.\nNew prior P(D) = 0.08966, P(not D) = 0.91034.\n\nStep 4: Apply Bayes theorem after the second positive test.\nP(D|++) = (0.98 * 0.08966) / (0.98*0.08966 + 0.05*0.91034)\n= 0.087867 / (0.087867 + 0.045517)\n= 0.087867 / 0.133384\n= 0.65876 (about 65.9 percent).\n\nAssumptions: The two tests are conditionally independent given disease status. The prevalence is accurate for this population. No verification bias.\n\nLimitations: If the tests share a common systematic error (e.g., cross-reactivity with another condition), the conditional independence assumption fails and the true posterior would be lower than 65.9 percent.\n\nAnswer: Approximately 65.9 percent probability of having the disease after two independent positive tests."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0017",
+    "source": "qwen3.8-max",
+    "domain": "math_stats",
+    "task_type": "calculate",
+    "difficulty": 4,
+    "tags": [
+      "expected-value",
+      "compound-game",
+      "decision-theory"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "A game works as follows: You pay an entry fee of $10. You roll a fair die. If you roll 1-2, you lose and get nothing. If you roll 3-4, you win $8 and the game ends. If you roll 5-6, you win $5 and get to roll again (same rules apply on the second roll, but the game ends after at most 2 rolls). What is the expected net profit, and what is the maximum entry fee that makes this game favorable?"
+      },
+      {
+        "role": "assistant",
+        "content": "Step 1: Analyze a single roll.\nP(1-2) = 2/6 = 1/3 -> lose, get $0.\nP(3-4) = 2/6 = 1/3 -> win $8, game ends.\nP(5-6) = 2/6 = 1/3 -> win $5, roll again.\n\nStep 2: Compute expected value of the second roll (if reached).\nThe second roll has the same structure but no further continuation:\nE[second roll] = (1/3)*0 + (1/3)*8 + (1/3)*5 = 0 + 8/3 + 5/3 = 13/3 = $4.333.\n\nStep 3: Compute expected value of the full game (gross winnings).\nE[gross] = (1/3)*0 + (1/3)*8 + (1/3)*(5 + E[second roll])\n= 0 + 8/3 + (1/3)*(5 + 13/3)\n= 8/3 + (1/3)*(28/3)\n= 8/3 + 28/9\n= 24/9 + 28/9\n= 52/9\n= $5.778.\n\nStep 4: Compute expected net profit.\nE[net] = E[gross] - entry fee = 52/9 - 10 = 5.778 - 10 = -$4.222.\n\nStep 5: Find the maximum favorable entry fee.\nThe game is favorable when entry fee < E[gross].\nMaximum entry fee = 52/9 = $5.78 (approximately).\n\nAssumptions: The die is fair. The player is risk-neutral. The second roll uses identical rules.\n\nLimitations: This analysis does not account for utility of money or variance. The game has high variance since the most likely single-roll outcomes are $0 or $5.\n\nAnswer: Expected net profit at a $10 entry fee is -$4.22. The maximum entry fee for a favorable game is approximately $5.78."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0018",
+    "source": "qwen3.8-max",
+    "domain": "math_stats",
+    "task_type": "calculate",
+    "difficulty": 3,
+    "tags": [
+      "conditional-probability",
+      "combinatorics",
+      "cards"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "From a standard 52-card deck, you draw 3 cards without replacement. Given that at least one card is a heart, what is the probability that all three cards are hearts?"
+      },
+      {
+        "role": "assistant",
+        "content": "Step 1: Define events.\nA = all 3 cards are hearts.\nB = at least 1 card is a heart.\nWe want P(A|B) = P(A and B) / P(B). Since A implies B, P(A and B) = P(A).\n\nStep 2: Compute P(A).\nThere are 13 hearts in a 52-card deck.\nP(A) = C(13,3) / C(52,3)\nC(13,3) = 286.\nC(52,3) = 22100.\nP(A) = 286 / 22100 = 0.012941.\n\nStep 3: Compute P(B) using the complement.\nP(B) = 1 - P(no hearts).\nP(no hearts) = C(39,3) / C(52,3).\nC(39,3) = 9139.\nP(no hearts) = 9139 / 22100 = 0.413529.\nP(B) = 1 - 0.413529 = 0.586471.\n\nStep 4: Apply conditional probability.\nP(A|B) = P(A) / P(B) = 0.012941 / 0.586471 = 0.022066.\n\nStep 5: Express as a fraction.\nP(A|B) = 286 / (22100 - 9139) = 286 / 12961 = 0.022066.\n\nAssumptions: Standard 52-card deck, fair shuffle, draws without replacement.\n\nLimitations: If the information 'at least one heart' was obtained by a specific observation method (e.g., the first card is a heart), the conditional probability would differ. This calculation assumes the information is simply that the event B occurred.\n\nAnswer: Approximately 2.21 percent, or exactly 286/12961."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0019",
+    "source": "qwen3.8-max",
+    "domain": "math_stats",
+    "task_type": "calculate",
+    "difficulty": 4,
+    "tags": [
+      "hypothesis-testing",
+      "t-test",
+      "p-value-interpretation"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "A two-sample t-test comparing conversion rates between a control group (n=500, conversion rate 12 percent) and a treatment group (n=500, conversion rate 15 percent) yields a p-value of 0.08. The test was conducted at alpha=0.05. A colleague says 'the p-value is 0.08, which means there is an 8 percent chance the null hypothesis is true.' Identify the errors in this interpretation and compute the approximate 95 percent confidence interval for the difference in proportions."
+      },
+      {
+        "role": "assistant",
+        "content": "Error 1: The p-value is NOT the probability that the null hypothesis is true. The p-value is P(observing data this extreme or more | H0 is true). It does not give P(H0 is true | data). These are fundamentally different conditional probabilities. The colleague is committing the inverse probability fallacy.\n\nError 2: A p-value of 0.08 at alpha=0.05 means we fail to reject H0. It does not mean the effect is 'almost significant' or that there is a 92 percent chance the alternative is true. The correct statement is: under the null hypothesis of no difference, there is an 8 percent probability of observing a difference as large as 3 percentage points or larger due to random sampling variation alone.\n\nError 3: The p-value does not measure effect size. A small p-value can correspond to a trivially small effect with large sample sizes, and a large p-value can correspond to a meaningful effect with small samples.\n\nConfidence Interval Calculation:\np1 = 0.12, p2 = 0.15, n1 = n2 = 500.\nDifference = p2 - p1 = 0.03.\nStandard error of the difference:\nSE = sqrt(p1*(1-p1)/n1 + p2*(1-p2)/n2)\n= sqrt(0.12*0.88/500 + 0.15*0.85/500)\n= sqrt(0.0002112 + 0.000255)\n= sqrt(0.0004662)\n= 0.021592.\n\n95 percent CI = difference +/- 1.96 * SE\n= 0.03 +/- 1.96 * 0.021592\n= 0.03 +/- 0.042320\n= (-0.012320, 0.072320).\n\nThe 95 percent CI for the difference is approximately (-1.23 percent, +7.23 percent). Since this interval includes zero, it is consistent with the p-value of 0.08 (failing to reject at alpha=0.05).\n\nAssumptions: Independent samples, large enough n for normal approximation.\n\nLimitations: The normal approximation for proportions is reasonable here since n*p and n*(1-p) are both greater than 10. A continuity correction or exact test would give slightly different bounds.\n\nAnswer: The colleague's interpretation is incorrect on three counts. The 95 percent CI for the difference is approximately -1.2 to +7.2 percentage points, which includes zero."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0020",
+    "source": "qwen3.8-max",
+    "domain": "math_stats",
+    "task_type": "calculate",
+    "difficulty": 5,
+    "tags": [
+      "poisson-process",
+      "exponential-distribution",
+      "queueing"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Requests arrive at a server according to a Poisson process with rate lambda=30 per minute. The server can process requests at a rate of mu=40 per minute (exponentially distributed service times). Compute: (a) the probability that more than 5 requests arrive in a 10-second window, (b) the average number of requests in the system (L), and (c) the probability that an arriving request must wait."
+      },
+      {
+        "role": "assistant",
+        "content": "Part (a): Probability of more than 5 arrivals in 10 seconds.\n\nLambda for 10 seconds = 30 per minute * (10/60) = 5.\nLet X ~ Poisson(5). We want P(X > 5) = 1 - P(X <= 5).\n\nP(X=k) = e^(-5) * 5^k / k!\nP(X=0) = e^(-5) * 1 = 0.006738\nP(X=1) = e^(-5) * 5 = 0.033690\nP(X=2) = e^(-5) * 25/2 = 0.084224\nP(X=3) = e^(-5) * 125/6 = 0.140374\nP(X=4) = e^(-5) * 625/24 = 0.175467\nP(X=5) = e^(-5) * 3125/120 = 0.175467\n\nP(X <= 5) = 0.006738 + 0.033690 + 0.084224 + 0.140374 + 0.175467 + 0.175467 = 0.615961.\nP(X > 5) = 1 - 0.615961 = 0.384039, approximately 38.4 percent.\n\nPart (b): Average number of requests in the system (M/M/1 queue).\n\nTraffic intensity rho = lambda/mu = 30/40 = 0.75.\nL = rho / (1 - rho) = 0.75 / 0.25 = 3.0 requests on average in the system.\n\nPart (c): Probability an arriving request must wait.\n\nIn an M/M/1 queue, the probability that the server is busy (and thus an arriving request must wait) equals rho.\nP(wait) = rho = 0.75, or 75 percent.\n\nAssumptions: Arrivals follow a Poisson process (memoryless inter-arrival times). Service times are exponentially distributed. Single server. Infinite queue capacity. First-come-first-served discipline. The system is in steady state (rho < 1, which holds since 0.75 < 1).\n\nLimitations: Real systems often have non-exponential service times, multiple servers, or finite capacity. The Poisson assumption may fail if arrivals are correlated (e.g., bursty traffic). For non-exponential service, use M/G/1 formulas instead.\n\nAnswer: (a) P(more than 5 in 10s) = 38.4 percent. (b) L = 3.0 requests. (c) P(wait) = 75 percent."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0021",
+    "source": "qwen3.8-max",
+    "domain": "system_design",
+    "task_type": "design",
+    "difficulty": 4,
+    "tags": [
+      "idempotency",
+      "payment-processing",
+      "exactly-once"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Design an idempotent payment processing endpoint that handles duplicate requests, concurrent submissions, and partial failures. Provide the architectural decision, trade-offs, and a code snippet for the core deduplication mechanism."
+      },
+      {
+        "role": "assistant",
+        "content": "Architectural Decision: Use a client-generated idempotency key combined with a server-side idempotency store backed by a transactional database.\n\nDesign:\n1. The client generates a unique idempotency key (UUID) for each logical payment intent and includes it in the request header.\n2. The server checks the idempotency store before processing. If the key exists and the request hash matches, return the stored response without reprocessing.\n3. If the key exists but the request hash differs, reject with a 422 (same key, different payload).\n4. If the key does not exist, insert a record with status 'processing', execute the payment, then update the record with the final response and status 'completed'.\n5. Use a database transaction or distributed lock to prevent two concurrent requests with the same key from both executing.\n\nTrade-offs:\n- Client-generated keys shift uniqueness responsibility to the client. Benefit: the server does not need to generate and distribute keys. Risk: clients may reuse keys incorrectly.\n- Storing full responses increases storage but enables exact replay. Alternative: store only a reference and recompute, but this risks non-deterministic responses.\n- The idempotency store must be transactional. A cache-only store (e.g., Redis without persistence) risks losing idempotency records on restart.\n\nCode Snippet - Core Deduplication:\n\nimport hashlib\nimport json\n\ndef compute_request_hash(payload: dict) -> str:\n    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'))\n    return hashlib.sha256(canonical.encode()).hexdigest()\n\ndef process_payment(idempotency_key: str, payload: dict, store):\n    req_hash = compute_request_hash(payload)\n\n    # Atomic check-and-insert using database transaction\n    with store.transaction():\n        existing = store.get(idempotency_key)\n        if existing:\n            if existing['request_hash'] != req_hash:\n                return {'status': 422, 'error': 'Key reused with different payload'}\n            if existing['status'] == 'completed':\n                return existing['response']  # Replay stored response\n            if existing['status'] == 'processing':\n                return {'status': 409, 'error': 'Request already in progress'}\n\n        # Insert new record atomically\n        store.insert({\n            'idempotency_key': idempotency_key,\n            'request_hash': req_hash,\n            'status': 'processing',\n            'response': None\n        })\n\n    # Execute payment outside the lock to minimize hold time\n    try:\n        result = execute_payment(payload)\n        response = {'status': 200, 'transaction_id': result['txn_id']}\n    except PaymentError as e:\n        response = {'status': 400, 'error': str(e)}\n\n    # Finalize: update the idempotency record with the response\n    with store.transaction():\n        store.update(idempotency_key, {\n            'status': 'completed',\n            'response': response\n        })\n\n    return response\n\nThis ensures exactly-once processing semantics for each idempotency key, handles concurrent duplicates via the 'processing' state, and detects payload mismatches via request hashing."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0022",
+    "source": "qwen3.8-max",
+    "domain": "system_design",
+    "task_type": "design",
+    "difficulty": 5,
+    "tags": [
+      "event-streaming",
+      "out-of-order",
+      "watermarks"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Design a system to process an out-of-order event stream where events have an event_time but may arrive up to 15 minutes late. The goal is to compute 5-minute tumbling window aggregates. Provide the architectural decision, trade-offs, and a code snippet for the watermark and windowing logic."
+      },
+      {
+        "role": "assistant",
+        "content": "Architectural Decision: Use event-time processing with watermarks and allowed lateness, similar to the Apache Beam / Flink model.\n\nDesign:\n1. Each event carries an event_time (when the action occurred) and an arrival_time (when the server received it).\n2. A watermark tracks the system's estimate of the maximum event_time seen so far minus a slack period. Events with event_time below the watermark are considered late.\n3. Windows are 5-minute tumbling windows based on event_time.\n4. A window fires (emits its aggregate) when the watermark passes the window's end time.\n5. Late events (arriving after the window fires) are handled by an allowed lateness period of 15 minutes. During this period, the window re-fires with updated aggregates.\n6. After the allowed lateness expires, late events are dropped or sent to a side output for manual reconciliation.\n\nTrade-offs:\n- A larger watermark delay (e.g., 15 minutes) reduces late events but increases output latency. A smaller delay produces faster results but more corrections.\n- Allowing re-fires means downstream consumers must handle updates (upserts), not just inserts. This requires idempotent downstream writes.\n- Storing window state for 15 minutes of lateness increases memory. For high-throughput streams, state must be persisted to a state backend (e.g., RocksDB or a database).\n\nCode Snippet - Watermark and Windowing:\n\nfrom collections import defaultdict\nimport time\n\nWATERMARK_SLACK_S = 900  # 15 minutes\nWINDOW_SIZE_S = 300       # 5 minutes\n\nclass WindowAggregator:\n    def __init__(self):\n        self.windows = defaultdict(lambda: {'sum': 0, 'count': 0})\n        self.watermark = 0\n        self.fired_windows = set()\n\n    def _window_key(self, event_time):\n        return int(event_time // WINDOW_SIZE_S) * WINDOW_SIZE_S\n\n    def process_event(self, event_time, arrival_time, value):\n        # Update watermark: max event_time seen minus slack\n        self.watermark = max(self.watermark, event_time - WATERMARK_SLACK_S)\n\n        wk = self._window_key(event_time)\n        window_end = wk + WINDOW_SIZE_S\n\n        # Check if event is too late (beyond allowed lateness)\n        if arrival_time > window_end + WATERMARK_SLACK_S:\n            return {'action': 'dropped_too_late', 'window': wk}\n\n        # Add to window\n        self.windows[wk]['sum'] += value\n        self.windows[wk]['count'] += 1\n\n        # Check if window should fire or re-fire\n        if self.watermark >= window_end:\n            agg = {\n                'window_start': wk,\n                'window_end': window_end,\n                'sum': self.windows[wk]['sum'],\n                'count': self.windows[wk]['count']\n            }\n            is_refire = wk in self.fired_windows\n            self.fired_windows.add(wk)\n            return {\n                'action': 'refire' if is_refire else 'fire',\n                'aggregate': agg\n            }\n\n        return {'action': 'buffered', 'window': wk}\n\nThis design ensures correctness under out-of-order arrival, bounds output latency via the watermark, and supports corrections via re-firing within the allowed lateness window."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0023",
+    "source": "qwen3.8-max",
+    "domain": "system_design",
+    "task_type": "design",
+    "difficulty": 3,
+    "tags": [
+      "bloom-filter",
+      "deduplication",
+      "probabilistic"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Design a deduplication layer for a high-throughput event ingestion pipeline using a Bloom filter. Provide the architectural decision, trade-offs, and a code snippet implementing the Bloom filter with configurable false positive rate."
+      },
+      {
+        "role": "assistant",
+        "content": "Architectural Decision: Use a Bloom filter as a fast probabilistic first-pass deduplication layer, followed by an exact store (e.g., a database or set) for events that pass the Bloom filter check.\n\nDesign:\n1. Every incoming event's deduplication key (e.g., event_id) is checked against the Bloom filter.\n2. If the Bloom filter says 'definitely not seen', the event is new. Add it to the Bloom filter and forward it.\n3. If the Bloom filter says 'possibly seen', check the exact store. If the event is truly a duplicate, drop it. If it is a false positive, forward it and add to the exact store.\n4. Periodically rotate the Bloom filter to handle a sliding deduplication window.\n\nTrade-offs:\n- Bloom filters have no false negatives (a 'not seen' answer is always correct) but have a configurable false positive rate. A 1 percent false positive rate means 1 percent of new events will require an extra exact-store lookup.\n- Memory usage is O(n * ln(1/fp) / (ln2)^2) bits, where n is expected items and fp is false positive rate. This is far less than storing all keys.\n- Bloom filters do not support deletion. For a sliding window, use a counting Bloom filter or rotate between two filters.\n\nCode Snippet - Bloom Filter:\n\nimport math\nimport hashlib\n\nclass BloomFilter:\n    def __init__(self, expected_items: int, fp_rate: float = 0.01):\n        # Calculate optimal size and number of hash functions\n        self.size = self._optimal_size(expected_items, fp_rate)\n        self.num_hashes = self._optimal_hashes(self.size, expected_items)\n        self.bit_array = bytearray(self.size)\n\n    def _optimal_size(self, n, p):\n        m = -(n * math.log(p)) / (math.log(2) ** 2)\n        return int(m) + 1\n\n    def _optimal_hashes(self, m, n):\n        k = (m / n) * math.log(2)\n        return max(1, int(k))\n\n    def _hashes(self, item: str):\n        h1 = int(hashlib.md5(item.encode()).hexdigest(), 16)\n        h2 = int(hashlib.sha1(item.encode()).hexdigest(), 16)\n        for i in range(self.num_hashes):\n            yield (h1 + i * h2) % self.size\n\n    def add(self, item: str):\n        for pos in self._hashes(item):\n            self.bit_array[pos] = 1\n\n    def might_contain(self, item: str) -> bool:\n        return all(self.bit_array[pos] for pos in self._hashes(item))\n\n# Usage in pipeline:\n# bloom = BloomFilter(expected_items=1_000_000, fp_rate=0.01)\n# if not bloom.might_contain(event_id):\n#     bloom.add(event_id)\n#     forward(event)\n# else:\n#     if exact_store.contains(event_id):\n#         drop(event)  # true duplicate\n#     else:\n#         bloom.add(event_id)\n#         forward(event)  # false positive\n\nThis gives O(1) dedup checks with ~10 Mbits for 1M items at 1 percent FP rate, versus ~100 MB for a hash set storing full keys."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0024",
+    "source": "qwen3.8-max",
+    "domain": "system_design",
+    "task_type": "design",
+    "difficulty": 4,
+    "tags": [
+      "state-machine",
+      "order-lifecycle",
+      "event-sourcing"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Design a state machine for an e-commerce order lifecycle that handles transitions from creation through payment, fulfillment, and potential cancellation or return. Provide the architectural decision, trade-offs, and a code snippet for the state transition logic with validation."
+      },
+      {
+        "role": "assistant",
+        "content": "Architectural Decision: Use an explicit finite state machine with a transition table, where each transition is validated before execution. All state changes are recorded as an append-only event log (event sourcing) for auditability.\n\nDesign:\n1. Define valid states: CREATED, PAYMENT_PENDING, PAID, FULFILLING, SHIPPED, DELIVERED, CANCELLED, RETURN_REQUESTED, RETURNED.\n2. Define valid transitions as a dictionary mapping (current_state, action) -> next_state.\n3. Every transition attempt is validated against the table. Invalid transitions raise an error and are logged.\n4. Each successful transition appends an event to the order's event history.\n\nTrade-offs:\n- An explicit transition table is easy to audit and extend but becomes verbose for complex workflows. A workflow engine (e.g., Temporal) may be better for very complex flows.\n- Event sourcing provides full auditability but requires replaying events to reconstruct current state, which adds read complexity. A materialized current-state snapshot mitigates this.\n- Allowing cancellation from multiple states increases flexibility but complicates inventory and payment rollback logic.\n\nCode Snippet - State Machine:\n\nclass OrderStateMachine:\n    TRANSITIONS = {\n        ('CREATED', 'submit_payment'): 'PAYMENT_PENDING',\n        ('PAYMENT_PENDING', 'payment_success'): 'PAID',\n        ('PAYMENT_PENDING', 'payment_failure'): 'CREATED',\n        ('PAYMENT_PENDING', 'cancel'): 'CANCELLED',\n        ('PAID', 'start_fulfillment'): 'FULFILLING',\n        ('PAID', 'cancel'): 'CANCELLED',\n        ('FULFILLING', 'ship'): 'SHIPPED',\n        ('SHIPPED', 'deliver'): 'DELIVERED',\n        ('DELIVERED', 'request_return'): 'RETURN_REQUESTED',\n        ('RETURN_REQUESTED', 'approve_return'): 'RETURNED',\n        ('RETURN_REQUESTED', 'deny_return'): 'DELIVERED',\n        ('CREATED', 'cancel'): 'CANCELLED',\n    }\n\n    def __init__(self, order_id):\n        self.order_id = order_id\n        self.state = 'CREATED'\n        self.history = []\n\n    def apply(self, action: str) -> str:\n        key = (self.state, action)\n        if key not in self.TRANSITIONS:\n            raise ValueError(\n                f'Invalid transition: {self.state} + {action}'\n            )\n        old_state = self.state\n        self.state = self.TRANSITIONS[key]\n        self.history.append({\n            'from': old_state,\n            'action': action,\n            'to': self.state\n        })\n        return self.state\n\n    def can(self, action: str) -> bool:\n        return (self.state, action) in self.TRANSITIONS\n\n# Example:\n# osm = OrderStateMachine('ORD-123')\n# osm.apply('submit_payment')   # -> PAYMENT_PENDING\n# osm.apply('payment_success')  # -> PAID\n# osm.apply('start_fulfillment') # -> FULFILLING\n# osm.apply('cancel')           # raises ValueError (cannot cancel from FULFILLING)\n\nThis design makes invalid transitions impossible to execute silently, provides a full audit trail, and centralizes the workflow logic in a single declarative table."
+      }
+    ]
+  },
+  {
+    "id": "breadth-v2-0025",
+    "source": "qwen3.8-max",
+    "domain": "system_design",
+    "task_type": "design",
+    "difficulty": 4,
+    "tags": [
+      "rate-limiter",
+      "token-bucket",
+      "distributed"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Design a distributed rate limiter that supports per-user limits with burst allowance. Provide the architectural decision, trade-offs, and a code snippet for a token bucket implementation with atomic operations."
+      },
+      {
+        "role": "assistant",
+        "content": "Architectural Decision: Use a token bucket algorithm backed by a shared store (Redis) for distributed coordination. Each user gets a bucket with a configurable refill rate and burst capacity.\n\nDesign:\n1. Each user's bucket is identified by a key: rate_limit:{user_id}:{endpoint}.\n2. The bucket has two parameters: refill_rate (tokens per second) and capacity (max burst).\n3. On each request, attempt to consume one token. If tokens are available, allow the request. If not, reject with HTTP 429 and a Retry-After header.\n4. Tokens are refilled lazily: compute elapsed time since last refill and add tokens up to capacity.\n5. Use Redis atomic operations (Lua script) to ensure check-and-consume is atomic across distributed nodes.\n\nTrade-offs:\n- Token bucket allows bursts up to capacity, which is more user-friendly than a strict fixed window. However, it requires more state (last_refill_time, tokens).\n- Redis as the shared store adds a network hop per request. For ultra-low-latency requirements, a local in-memory limiter with periodic sync may be preferable, at the cost of temporary over-admission.\n- Lazy refill avoids a background refill process but means the first request after a long idle period gets a full burst allowance.\n\nCode Snippet - Token Bucket with Redis Lua:\n\nimport time\nimport redis\n\nr = redis.Redis()\n\n# Lua script for atomic token bucket check-and-consume\nTOKEN_BUCKET_SCRIPT = \"\"\"\nlocal key = KEYS[1]\nlocal capacity = tonumber(ARGV[1])\nlocal refill_rate = tonumber(ARGV[2])\nlocal now = tonumber(ARGV[3])\nlocal requested = tonumber(ARGV[4])\n\nlocal bucket = redis.call('HMGET', key, 'tokens', 'last_refill')\nlocal tokens = tonumber(bucket[1])\nlocal last_refill = tonumber(bucket[2])\n\nif tokens == nil then\n    tokens = capacity\n    last_refill = now\nend\n\nlocal elapsed = math.max(0, now - last_refill)\nlocal refill = elapsed * refill_rate\ntokens = math.min(capacity, tokens + refill)\n\nif tokens >= requested then\n    tokens = tokens - requested\n    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)\n    redis.call('EXPIRE', key, math.ceil(capacity / refill_rate) + 10)\n    return 1\nelse\n    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)\n    redis.call('EXPIRE', key, math.ceil(capacity / refill_rate) + 10)\n    return 0\nend\n\"\"\"\n\nscript_sha = r.script_load(TOKEN_BUCKET_SCRIPT)\n\ndef check_rate_limit(user_id: str, endpoint: str,\n                     capacity: int = 100,\n                     refill_rate: float = 10.0) -> bool:\n    key = f'rate_limit:{user_id}:{endpoint}'\n    now = time.time()\n    result = r.evalsha(script_sha, 1, key, capacity, refill_rate, now, 1)\n    return result == 1\n\n# Usage:\n# if not check_rate_limit('user_42', '/api/orders', capacity=50, refill_rate=5.0):\n#     return Response(status=429, headers={'Retry-After': '1'})\n\nThe Lua script ensures atomicity: no two concurrent requests can both read the same token count and both consume. The EXPIRE call prevents stale buckets from accumulating indefinitely."
+      }
+    ]
+  }
+]
