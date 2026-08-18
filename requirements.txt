@@ -1,0 +1,7 @@
+# QLM 1 dataset curation pipeline — teacher-side tooling only.
+# (Chousorus 1 inference depends on none of this: the Golden Rule.)
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+statsmodels>=0.14
+jsonschema>=4.20
