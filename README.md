@@ -84,3 +84,24 @@ re-gate.
   that always "finds alpha" teaches motivated reasoning.
 - **Curriculum:** train on stage 1 first, introduce stages 2–3 as steps
   progress; `dist/manifest.json` records the exact ordering.
+
+## Colab notebooks (`notebooks/`)
+
+Seven unexecuted Colab notebooks for dataset collection, validation,
+normalization, curriculum building, and RLM-trajectory export (run in order;
+`00_setup` first in every fresh session):
+
+| Notebook | Purpose |
+|---|---|
+| `00_setup` | deps, `/content/data` tree, CONFIG, shared `qlm_utils.py` |
+| `01_load_qlm_v2_entries` | load + validate the six QLM v2 entries (no code execution) |
+| `02_download_external_datasets` | loaders: Jane Street puzzles, QuantQA, QuantCodeEval, BizBench, FinMME (streamed subset), QuantBench (clone+inspect manifest), QuantNet-style synthetic multi-market adapter, Kaggle placeholder |
+| `03_normalize_external_datasets` | unified SFT schema, robust field detection, unpaired/error routing |
+| `04_load_qwen_breadth` | Qwen 3.8 Max breadth (file preferred, pasted JSONL fallback; sample embedded) |
+| `05_build_unified_corpus_and_curriculum` | unified corpus + 3 curriculum stages + manifests |
+| `06_export_rlm_trajectories` | QLM entries -> RLM trajectories; real stdout logs if present, marked templates otherwise |
+
+Notebook sources live in `notebooks/src/*.cells.py` (cells separated by
+`# --- CELL ---`); `python tools/build_notebooks.py` serializes them to
+`.ipynb` with a static syntax check and never executes any cell.
+The 25-row Qwen breadth seed batch is at `data/breadth/qwen38_breadth.jsonl`.
