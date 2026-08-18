@@ -50,16 +50,24 @@ python3 tests/test_pipeline.py      # smoke tests (also: python -m pytest tests/
 
 ## Seed corpus (`data/entries/`)
 
-Three exemplar entries spanning the curriculum, each fully self-contained
-(seeded synthetic data generators — no network, no vendor data — so the
-*methodology* is what the student learns) and each reaching a **different
-calibrated verdict**, so the model never learns "always conclude success":
+Eleven execution-verified entries spanning the curriculum, each fully
+self-contained (seeded synthetic data generators — no network, no vendor
+data — so the *methodology* is what the student learns), with **diverse
+calibrated verdicts** so the model never learns "always conclude success":
 
-| Entry | Complexity | Study | Executed verdict |
-|---|---|---|---|
-| `001_sma_crossover` | 3 | SMA 20/100 trend rule, turnover costs, moving-block bootstrap | `FAIL_TO_REJECT_H0` — honest null result (bootstrap p ≈ 0.71) |
-| `002_pairs_engle_granger` | 6 | Engle-Granger cointegration, frozen formation params, OOS z-score trading | `COINTEGRATED_TRADEABLE` — ADF p ≈ 0.006, γ̂ = 1.4145 vs true 1.4, half-life 17.5d vs true 15d |
-| `003_garch_qlike_dm` | 8 | Hand-rolled GARCH(1,1) QMLE, walk-forward forecasts, QLIKE + Diebold-Mariano vs EWMA | `NO_SIGNIFICANT_EDGE` — even under a true GARCH DGP (DM p ≈ 0.26): an upper-bound calibration lesson |
+| Entry | Cx | Kind | Study | Executed verdict |
+|---|---|---|---|---|
+| `001_sma_crossover` | 3 | correct | SMA 20/100 trend rule, costs, moving-block bootstrap | `FAIL_TO_REJECT_H0` (p ≈ 0.71, honest null) |
+| `004_adversarial_lookahead_sma` | 4 | adversarial | same-bar execution trap: naive Sharpe 0.99 → lagged 0.27 | `REJECTED_LOOKAHEAD_BIAS` |
+| `008_adv_survivorship_bias` | 5 | adversarial | survivor-only momentum: naive Sharpe 1.74 → audited 0.39 | `REJECTED_SURVIVORSHIP_BIAS` |
+| `002_pairs_engle_granger` | 6 | correct | Engle-Granger cointegration, frozen params, OOS trading | `COINTEGRATED_TRADEABLE` (γ̂ 1.4145 vs 1.4) |
+| `009_risk_es_vs_var` | 6 | correct | ES vs VaR under Student-t tails + Cornish-Fisher | `ES_CAPTURES_TAIL_RISK` |
+| `005_adversarial_p_hacking_sweep` | 7 | adversarial | 48-config sweep on noise: naive p 0.008 → corrected 0.19 | `REJECTED_P_HACKING` |
+| `007_options_bsm_calibration` | 7 | correct | BSM IV via safeguarded Newton-Raphson, OTM instruments | `CALIBRATION_VERIFIED` (max err 2e-12) |
+| `003_garch_qlike_dm` | 8 | correct | GARCH(1,1) QMLE, QLIKE + Diebold-Mariano vs EWMA | `NO_SIGNIFICANT_EDGE` (DM p ≈ 0.26) |
+| `006_rlm_environment_garch` | 8 | rlm_environment | vol-forecasting env, guards + deterministic replay | `ENVIRONMENT_VERIFIED` |
+| `010_rlm_portfolio_rebalance` | 8 | rlm_environment | risk-parity rebalancing env, waterfall capping | `ENVIRONMENT_VERIFIED` |
+| `011_microstructure_lob` | 8 | correct | LOB: spread vs OFI, queue position, adverse selection | `MICROSTRUCTURE_MODEL_VALIDATED` |
 
 Every entry follows the 16-stage cognitive pipeline (Deconstruct →
 Hypothesize → … → Falsify → Conclude → Report) and carries all five

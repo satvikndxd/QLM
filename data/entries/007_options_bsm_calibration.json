@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "entry_kind": "correct",
+  "expected_verdict": "CALIBRATION_VERIFIED",
+  "flaws": [],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "implied_vol",
+        "reason": "iterative root-finding: each Newton/bisection step depends on the previous iterate (all 10 options vectorized within each step)",
+        "max_iterations": 100
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "tool_use",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000007-options-bsm-calibration",
+    "domain": "Options Pricing / Volatility Calibration",
+    "complexity": 7,
+    "tags": [
+      "black-scholes",
+      "implied-volatility",
+      "newton-raphson",
+      "bisection-safeguard",
+      "otm-instruments",
+      "vega",
+      "put-call-parity"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "The task is inverse-problem calibration with known ground truth: generate a synthetic chain from a deterministic smile, then recover the surface from prices alone. The two failure modes to anticipate before writing any code are (1) deep-ITM options whose price is almost all intrinsic value — vega collapses and any gradient method stalls, so calibration must use the OTM instrument at each strike (put below forward, call above, identical IV by parity); (2) raw Newton-Raphson divergence from poor starting points, solved by bracketing with a bisection fallback since option price is strictly monotone in volatility.",
+    "tool_selection": "Python REPL with numpy for the vectorized solver and scipy.stats for the normal CDF/PDF. No optimizer library: hand-rolling the safeguarded Newton iteration IS the lesson — root-finding hygiene the student must internalize.",
+    "recursive_delegation": "Not needed for 10 options. At production scale (thousands of quotes across an expiry grid), shard strikes to sub-agents but keep surface-level no-arbitrage checks (butterfly/calendar) in the parent, since they are cross-option constraints no single-quote solver can see."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "H0: the calibration pipeline is faithful — for every option i, the recovered sigma_i satisfies |sigma_i - sigma_true,i| < 1e-6 and the solver converges (|price(sigma_i) - target_i| < 1e-10) within 100 iterations. H1: at least one option fails convergence or tolerance, indicating a solver defect (typically vega collapse on ITM instruments). Verdict CALIBRATION_VERIFIED requires all options converged, max IV error < 1e-6, and intrinsic-value bounds satisfied on the generated chain.",
+    "data_engineering": "Synthetic chain: 5 strikes (80-120) x 2 expiries (0.25y, 1y), S0=100, r=2%, q=0. True surface sigma(K,T) = 0.20 + 0.30*(K/S0-1)^2 - 0.02*(T-0.5): a smile with curvature and a mild term slope, so recovery is pointwise nontrivial. Prices are exact BS values — no noise — because the entry tests solver correctness, not statistical estimation; on real quotes, bid-ask midpoints, discrete dividends, and stale prices must be handled before this solver runs.",
+    "methodology_justification": "Newton-Raphson with the analytic vega is quadratically convergent near the root, but naked NR fails on far-OTM starts where vega is tiny; the safeguard maintains a [lo, hi] bracket updated by the sign of the pricing error (valid because price is strictly increasing in sigma) and substitutes a bisection step whenever the Newton step exits the bracket. OTM instrument selection (puts for K < forward) is the standard practitioner fix for the ITM vega-collapse problem and is exact by put-call parity. The solver is vectorized across all options simultaneously with per-option convergence freezing.",
+    "code_implementation": "\"\"\"Black-Scholes implied-volatility calibration via safeguarded\nNewton-Raphson on a synthetic options chain (5 strikes x 2 expiries).\n\nGround truth is known by construction: prices are generated from a\ndeterministic smile surface, so the calibrated IVs must recover it to\nnear machine precision. Key numerical lessons: (1) calibrate on OTM\ninstruments (puts below the forward, calls above) because deep-ITM\noptions carry almost no vol information (price ~ intrinsic, vega ~ 0);\n(2) plain Newton-Raphson diverges from bad starts, so the solver brackets\nthe root and falls back to bisection whenever the Newton step leaves the\nbracket — price is monotone in sigma, so the bracket always tightens.\nDeterministic; no randomness needed at all.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nfrom scipy import stats\n\nS0, R, Q = 100.0, 0.02, 0.0\nSTRIKES = np.array([80.0, 90.0, 100.0, 110.0, 120.0])\nEXPIRIES = np.array([0.25, 1.0])\nPRICE_TOL = 1e-10\nIV_TOL = 1e-6\nMAX_ITER = 100\n\n\ndef true_vol_surface(K: np.ndarray, T: np.ndarray) -> np.ndarray:\n    \"\"\"Deterministic smile: base vol + moneyness curvature + term slope.\"\"\"\n    m = K / S0 - 1.0\n    return 0.20 + 0.30 * m**2 - 0.02 * (T - 0.5)\n\n\ndef bs_d1(S, K, T, r, q, sigma):\n    return (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))\n\n\ndef bs_call(S, K, T, r, q, sigma):\n    d1 = bs_d1(S, K, T, r, q, sigma)\n    d2 = d1 - sigma * np.sqrt(T)\n    return S * np.exp(-q * T) * stats.norm.cdf(d1) - K * np.exp(-r * T) * stats.norm.cdf(d2)\n\n\ndef bs_put(S, K, T, r, q, sigma):\n    \"\"\"Via put-call parity: same IV as the call by construction.\"\"\"\n    return bs_call(S, K, T, r, q, sigma) - S * np.exp(-q * T) + K * np.exp(-r * T)\n\n\ndef bs_vega(S, K, T, r, q, sigma):\n    return S * np.exp(-q * T) * stats.norm.pdf(bs_d1(S, K, T, r, q, sigma)) * np.sqrt(T)\n\n\ndef implied_vol(target: np.ndarray, K: np.ndarray, T: np.ndarray,\n                use_put: np.ndarray) -> tuple:\n    \"\"\"Vectorized safeguarded Newton-Raphson (Newton + bisection bracket).\n\n    All 10 options are solved simultaneously; converged entries freeze.\n    \"\"\"\n    def price(sig):\n        return np.where(use_put, bs_put(S0, K, T, R, Q, sig),\n                        bs_call(S0, K, T, R, Q, sig))\n\n    lo = np.full(len(K), 1e-4)\n    hi = np.full(len(K), 5.0)\n    # Brenner-Subrahmanyam-style start, clamped into the bracket.\n    sigma = np.clip(np.sqrt(2.0 * np.pi / T) * target / S0, 0.05, 2.0)\n    converged = np.zeros(len(K), dtype=bool)\n    iters = np.zeros(len(K))\n    for _ in range(MAX_ITER):\n        diff = price(sigma) - target\n        converged |= np.abs(diff) < PRICE_TOL\n        if converged.all():\n            break\n        # tighten the bracket (price is strictly increasing in sigma)\n        hi = np.where(diff > 0, sigma, hi)\n        lo = np.where(diff < 0, sigma, lo)\n        vega = bs_vega(S0, K, T, R, Q, sigma)\n        newton = sigma - diff / np.maximum(vega, 1e-12)\n        ok = (newton > lo) & (newton < hi) & (vega > 1e-8)\n        sigma = np.where(converged, sigma,\n                         np.where(ok, newton, 0.5 * (lo + hi)))\n        iters += ~converged\n    return sigma, converged, iters\n\n\ndef main() -> None:\n    K_grid, T_grid = np.meshgrid(STRIKES, EXPIRIES, indexing=\"ij\")\n    K, T = K_grid.ravel(), T_grid.ravel()\n    true_iv = true_vol_surface(K, T)\n\n    # Synthetic chain: exact BS prices from the true surface.\n    call_prices = bs_call(S0, K, T, R, Q, true_iv)\n    fwd = S0 * np.exp((R - Q) * T)\n    use_put = K < fwd  # OTM instrument selection: puts below the forward\n    target = np.where(use_put, bs_put(S0, K, T, R, Q, true_iv), call_prices)\n\n    # No-arbitrage sanity on the generated chain before calibrating.\n    intrinsic_ok = bool((call_prices >= np.maximum(\n        S0 * np.exp(-Q * T) - K * np.exp(-R * T), 0.0) - 1e-12).all())\n\n    iv_hat, converged, iters = implied_vol(target, K, T, use_put)\n    max_err = float(np.abs(iv_hat - true_iv).max())\n    reprice_err = float(np.abs(\n        bs_call(S0, K, T, R, Q, iv_hat) - call_prices).max())\n\n    ok = converged.all() and max_err < IV_TOL and intrinsic_ok\n    print(\"RESULTS\")\n    print(f\"n_options={len(K)}\")\n    print(f\"n_otm_puts={int(use_put.sum())}\")\n    print(f\"all_converged={bool(converged.all())}\")\n    print(f\"max_abs_iv_error={max_err:.3e}\")\n    print(f\"max_reprice_error={reprice_err:.3e}\")\n    print(f\"mean_solver_iterations={iters.mean():.1f}\")\n    print(f\"max_solver_iterations={int(iters.max())}\")\n    print(f\"intrinsic_bounds_ok={intrinsic_ok}\")\n    print(f\"verdict={'CALIBRATION_VERIFIED' if ok else 'CALIBRATION_FAILED'}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic checks: max_abs_iv_error ~2e-12 (far below the 1e-6 tolerance), all 10 options converged, max 9 iterations (quadratic convergence visible in the low iteration count), max_reprice_error at machine precision, and intrinsic bounds hold on the generated chain. Robustness probes for the student: shift the surface level to 0.05 and 0.80 and confirm convergence still holds; drop the bisection safeguard and observe the deep-ITM failures reappear — the safeguard, not Newton, is what makes the solver production-grade.",
+    "risk_and_backtest_audit": "No backtest here; the audit targets numerical risk. (a) Vega floor 1e-12 prevents division blow-ups but must never mask non-convergence — the convergence flag, not the floor, is the arbiter. (b) The bracket [1e-4, 5] bounds the vol space; quotes implying vols outside it are data errors, not solver failures, and must be rejected upstream. (c) On real chains, arbitrage violations (negative butterflies) make IVs non-existent — the intrinsic-bound check must run BEFORE calibration so bad quotes fail loudly. (d) IV errors propagate nonlinearly into greeks: a 1e-4 IV error is harmless for delta but material for short-dated gamma near expiry."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) Calibrating ITM calls directly looks fine ATM and silently fails deep ITM — the max error hides at the chain's edges, so per-option (not average) error must be checked. (2) A fixed-count Newton loop without a convergence flag reports plausible garbage on the stalled options. (3) The Brenner start formula is ATM-specific; using it far OTM without clamping can start Newton in a near-zero-vega region. (4) Noise-free synthetic prices overstate real-world precision: with 1-tick quote noise, IV error scales as tick/vega and explodes for short-dated wings.",
+    "falsification_strategy": "Break the solver on purpose and confirm detection: (a) force calls-only calibration — the deep-ITM options must fail the 1e-6 tolerance and flip the verdict to CALIBRATION_FAILED; (b) remove the bracket fallback and confirm non-convergence is reported, not silently absorbed; (c) perturb one input price by 1% and verify only that option's IV moves materially (locality check); (d) set an expiry to 1 day and confirm wing IVs remain recoverable or fail loudly.",
+    "limitations": "Black-Scholes IV is a quoting convention, not a model endorsement: constant-vol dynamics are contradicted by the very smile being calibrated. The entry covers European options without dividends; American exercise premia and discrete dividends require binomial/PDE de-Americanization before IV extraction. Noise-free prices make this an upper bound on real-chain precision, and no cross-strike arbitrage repair (butterfly smoothing) is performed."
+  },
+  "agent_instructions": "1. Generate the synthetic chain from the declared true surface; verify intrinsic bounds before calibrating. 2. Select the OTM instrument per strike via the forward; compute targets with put-call parity. 3. Run the safeguarded Newton solver vectorized across all options; freeze converged entries. 4. Assert all converged and max |IV error| < 1e-6 against ground truth; report per-option errors, not just the mean. 5. Reprice calls from calibrated IVs and confirm machine-precision round-trip. 6. Falsification: rerun calls-only and confirm the deep-ITM failure is detected and the verdict flips. 7. Report iteration counts (quadratic convergence evidence) and state the noise-free caveat explicitly.",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": [
+      "RESULTS",
+      "n_options=10",
+      "all_converged=True",
+      "max_abs_iv_error=",
+      "intrinsic_bounds_ok=True",
+      "verdict=CALIBRATION_VERIFIED"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "scipy"
+    ]
+  }
+}

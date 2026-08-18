@@ -1,0 +1,82 @@
+{
+  "schema_version": 2,
+  "entry_kind": "correct",
+  "expected_verdict": "ES_CAPTURES_TAIL_RISK",
+  "flaws": [],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": []
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "tool_use",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000009-risk-es-vs-var",
+    "domain": "Risk Modeling / Tail Risk",
+    "complexity": 6,
+    "tags": [
+      "expected-shortfall",
+      "value-at-risk",
+      "historical-simulation",
+      "student-t",
+      "fat-tails",
+      "cornish-fisher",
+      "quantile-crossover"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "The question 'is ES better than VaR?' must be operationalized: on a return distribution with known heavy tails (Student-t, df=5, so excess kurtosis 6 by construction), quantify exactly what VaR misses — the severity of losses beyond the quantile — and verify the empirical ES/VaR ratio exceeds its Gaussian counterpart at both 95% and 99%. A second, subtler prediction disciplines the analysis: the t/normal quantile crossover means Gaussian VaR should OVERSTATE the 95% loss and UNDERSTATE the 99% one; finding both directions confirms the machinery rather than a one-sided bias.",
+    "tool_selection": "Python REPL with numpy for simulation and quantile arithmetic, scipy.stats for the t generator, normal quantiles, and sample skew/kurtosis. Historical simulation needs no optimizer; the Cornish-Fisher expansion is closed-form.",
+    "recursive_delegation": "Not needed for one series. For a book-level risk run (hundreds of desks), delegate per-desk ES computation to sub-agents but keep aggregation in the parent: ES is subadditive so the book ES is bounded by the sum, and the parent must own the copula/correlation assumptions that individual desk agents cannot see."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "H0 (all must hold for ES_CAPTURES_TAIL_RISK): (a) ES > VaR at 95% and 99%; (b) empirical ES/VaR ratio > Gaussian ES/VaR ratio at both levels (tail heaviness beyond Gaussian); (c) Cornish-Fisher adjusts the Gaussian quantile toward the empirical one (sign(CF - G_VaR) = sign(HS_VaR - G_VaR)) at both levels; (d) the quantile crossover holds: Gaussian VaR95 > HS VaR95 while Gaussian VaR99 < HS VaR99. Any failed check yields TAIL_CHECKS_FAILED — the checks are falsifiable predictions from t-distribution theory, not descriptive statistics.",
+    "data_engineering": "5000 seeded daily returns from Student-t(5) scaled to 15% annualized unconditional vol — the scaling must divide by sqrt(df/(df-2)) or every risk number silently inflates ~29%, a bug the code documents explicitly. df=5 is chosen so excess kurtosis (6/(df-4)=6) is finite: df<=4 would make sample kurtosis non-convergent and the Cornish-Fisher input meaningless. On real data this step also requires cleaning stale prints and deciding whether to measure VaR on raw or vol-standardized (filtered HS) returns.",
+    "methodology_justification": "Historical simulation is the reference method because it imposes no distributional assumption — the empirical quantile and tail mean are consistent estimators regardless of the true law — making it the fair judge between Gaussian and CF approximations. ES over VaR is motivated by theory (ES is coherent/subadditive; VaR is not) but the entry demonstrates the PRACTICAL gap: identical VaR can hide arbitrarily bad tails, which the ES/VaR ratio surfaces. Cornish-Fisher is included as the standard practitioner shortcut precisely so its failure mode — magnitude overshoot at high kurtosis, outside its validity domain — is taught alongside its correct directional behavior.",
+    "code_implementation": "\"\"\"Expected Shortfall vs Value-at-Risk under fat tails, via historical\nsimulation on Student-t returns, with a Cornish-Fisher comparison.\n\nLessons encoded: (1) VaR is a quantile and says nothing about loss\nseverity BEYOND the quantile; ES integrates the tail and captures what\nVaR misses — the gap widens with tail heaviness and confidence level.\n(2) Gaussian risk formulas understate the deep tail of t-distributed\nreturns and OVERSTATE moderate quantiles (the t/normal quantile\ncrossover). (3) Cornish-Fisher corrects the Gaussian quantile in the\nright DIRECTION at both levels but overshoots in magnitude when excess\nkurtosis is large — its validity domain is the honest caveat.\nDeterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nfrom scipy import stats\n\nRNG_SEED = 9\nN_DAYS = 5000\nDF = 5                     # excess kurtosis 6/(df-4) = 6: finite but heavy\nANN_VOL = 0.15\nMU_DAILY = 0.0002\nLEVELS = (0.95, 0.99)\n\n\ndef simulate_returns(seed: int) -> np.ndarray:\n    \"\"\"Student-t returns scaled so the UNCONDITIONAL vol is 15% annualized.\n\n    The t variance is df/(df-2), so the raw draws must be divided by its\n    square root — forgetting this rescaling is a classic bug that\n    silently inflates every risk number by ~29% at df=5.\n    \"\"\"\n    rng = np.random.default_rng(seed)\n    scale = (ANN_VOL / np.sqrt(252)) / np.sqrt(DF / (DF - 2))\n    return MU_DAILY + scale * rng.standard_t(DF, N_DAYS)\n\n\ndef hs_var_es(r: np.ndarray, level: float) -> tuple:\n    \"\"\"Historical-simulation VaR and ES (losses reported as positive).\n\n    ES averages ALL returns at or beyond the VaR quantile — the tail\n    integral VaR ignores.\"\"\"\n    q = np.quantile(r, 1.0 - level)\n    return -float(q), -float(r[r <= q].mean())\n\n\ndef gaussian_var_es(r: np.ndarray, level: float) -> tuple:\n    \"\"\"Parametric Gaussian benchmark with the same mean/sd.\"\"\"\n    mu, sd = r.mean(), r.std(ddof=1)\n    z = stats.norm.ppf(1.0 - level)\n    var = -(mu + z * sd)\n    es = -(mu - sd * stats.norm.pdf(z) / (1.0 - level))\n    return float(var), float(es)\n\n\ndef cornish_fisher_var(r: np.ndarray, level: float) -> float:\n    \"\"\"Cornish-Fisher expansion: skew/kurtosis-adjusted Gaussian quantile.\"\"\"\n    mu, sd = r.mean(), r.std(ddof=1)\n    S = stats.skew(r)\n    K = stats.kurtosis(r)          # excess kurtosis\n    z = stats.norm.ppf(1.0 - level)\n    z_cf = (z + (z**2 - 1.0) * S / 6.0 + (z**3 - 3.0 * z) * K / 24.0\n            - (2.0 * z**3 - 5.0 * z) * S**2 / 36.0)\n    return float(-(mu + z_cf * sd))\n\n\ndef main() -> None:\n    r = simulate_returns(RNG_SEED)\n    S = float(stats.skew(r))\n    K = float(stats.kurtosis(r))\n\n    print(\"RESULTS\")\n    print(f\"n_days={N_DAYS}\")\n    print(f\"sample_skew={S:.3f}\")\n    print(f\"sample_excess_kurtosis={K:.3f}\")\n\n    checks = {}\n    for level in LEVELS:\n        tag = str(int(level * 100))\n        var_hs, es_hs = hs_var_es(r, level)\n        var_g, es_g = gaussian_var_es(r, level)\n        cf = cornish_fisher_var(r, level)\n        ratio_hs = es_hs / var_hs\n        ratio_g = es_g / var_g\n        print(f\"hs_var_{tag}={var_hs * 100:.3f}pct\")\n        print(f\"hs_es_{tag}={es_hs * 100:.3f}pct\")\n        print(f\"gaussian_var_{tag}={var_g * 100:.3f}pct\")\n        print(f\"gaussian_es_{tag}={es_g * 100:.3f}pct\")\n        print(f\"cf_var_{tag}={cf * 100:.3f}pct\")\n        print(f\"es_var_ratio_{tag}={ratio_hs:.3f}\")\n        print(f\"gaussian_es_var_ratio_{tag}={ratio_g:.3f}\")\n        # ES must exceed VaR (tail severity), and the empirical ES/VaR\n        # ratio must exceed the Gaussian one (fat tails).\n        checks[f\"es_exceeds_var_{tag}\"] = es_hs > var_hs\n        checks[f\"tail_heavier_than_gaussian_{tag}\"] = ratio_hs > ratio_g\n        # CF must adjust the Gaussian quantile TOWARD the empirical one\n        # (correct direction), even where it overshoots in magnitude.\n        checks[f\"cf_direction_correct_{tag}\"] =             np.sign(cf - var_g) == np.sign(var_hs - var_g)\n\n    # The t/normal crossover: Gaussian OVERSTATES the 95% quantile and\n    # UNDERSTATES the 99% one — direction flips across the crossover.\n    var95_hs, _ = hs_var_es(r, 0.95)\n    var99_hs, _ = hs_var_es(r, 0.99)\n    var95_g, _ = gaussian_var_es(r, 0.95)\n    var99_g, _ = gaussian_var_es(r, 0.99)\n    checks[\"gaussian_overstates_95\"] = var95_g > var95_hs\n    checks[\"gaussian_understates_99\"] = var99_g < var99_hs\n\n    for name, passed in checks.items():\n        print(f\"check_{name}={passed}\")\n    ok = all(checks.values())\n    print(f\"verdict={'ES_CAPTURES_TAIL_RISK' if ok else 'TAIL_CHECKS_FAILED'}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at seed 9: sample excess kurtosis ~4.5; HS VaR95 ~1.46% vs ES95 ~2.03% (ratio 1.39 vs Gaussian 1.26); HS VaR99 ~2.31% vs ES99 ~3.03% (ratio 1.31 vs Gaussian 1.15); crossover confirmed (Gaussian VaR95 1.55% > HS 1.46%; Gaussian VaR99 2.21% < HS 2.31%); CF direction correct at both levels while overshooting in magnitude (CF VaR99 ~2.85% vs HS 2.31%) — reported, not hidden. Robustness: rerun across 20 seeds and with df in {5, 8, 20}; all ratio gaps must shrink monotonically toward zero as df grows (Gaussian limit), a dose-response check on the entire pipeline.",
+    "risk_and_backtest_audit": "Estimation risk concentrates in the tail: ES99 from 5000 days averages only ~50 observations, so its sampling error is materially larger than VaR99's — production ES must ship with bootstrap confidence bands, and this is why Basel's FRTB pairs ES with quantile backtesting rather than direct ES backtesting (ES is not elicitable on its own). The unconditional HS window ignores volatility clustering: in a GARCH world, 5000-day HS under-responds to current regimes — filtered HS (vol-rescaled) is the deployment upgrade. CF-based capital at 99% with kurtosis ~4.5 would OVER-reserve here; the validity-domain caveat is a capital-efficiency issue, not pedantry."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The t-scaling bug (forgetting sqrt(df/(df-2))) inflates all numbers consistently, so internal ratio checks still pass while every level is wrong — absolute levels must be validated against the 15% vol target. (2) Quantile interpolation conventions shift VaR99 by several percent of its value at n=5000; fix the convention before comparing methods. (3) Sample skew of symmetric-t draws is nonzero in finite samples (~0.43 here); feeding it to CF is correct practice but means CF 'corrects' for skew that is sampling noise. (4) Reporting ES without its estimation error invites false precision — the deep-tail mean is the least stable statistic in this entire entry.",
+    "falsification_strategy": "(a) Replace the t generator with Gaussian draws: every tail-heaviness and crossover check must FAIL (ratios converge, CF ≈ Gaussian), confirming the checks detect tails rather than always passing. (b) Increase df to 30 and verify all gaps shrink toward zero monotonically. (c) Negate the returns (flip skew): ES/VaR conclusions must be mirror-consistent. (d) Halve the sample to 2500 and confirm conclusions survive, establishing they are not sample-size artifacts.",
+    "limitations": "Unconditional historical simulation ignores volatility clustering and regime shifts; conclusions apply to the marginal distribution, not to day-ahead conditional risk. The Cornish-Fisher validity domain excludes the very high-kurtosis cases where correction matters most — beyond it, fit a parametric tail (GPD/EVT) instead. ES lacks direct elicitability, complicating backtesting. All numbers are single-asset; portfolio ES additionally requires dependence modeling that this entry does not touch."
+  },
+  "agent_instructions": "1. Simulate seeded t(5) returns; verify realized annualized vol is within 5% of the 15% target (catches the scaling bug). 2. Compute HS VaR and ES at 95% and 99%; assert ES > VaR at both. 3. Compute Gaussian VaR/ES from sample moments; compare ES/VaR ratios and record the tail-heaviness gap. 4. Test the quantile crossover: Gaussian must overstate the 95% loss and understate the 99% one. 5. Compute Cornish-Fisher VaR at both levels; check direction against HS, and report the magnitude overshoot honestly with the validity-domain explanation. 6. Falsification: rerun with Gaussian draws and confirm the checks fail; rerun with df=30 and confirm monotone gap shrinkage. 7. Conclude with ES_CAPTURES_TAIL_RISK only if every check passed, and state the estimation-error caveat on deep-tail ES.",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": [
+      "RESULTS",
+      "hs_var_95=",
+      "hs_es_95=",
+      "hs_var_99=",
+      "hs_es_99=",
+      "cf_var_99=",
+      "check_es_exceeds_var_95=True",
+      "check_es_exceeds_var_99=True",
+      "check_tail_heavier_than_gaussian_99=True",
+      "verdict=ES_CAPTURES_TAIL_RISK"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "scipy"
+    ]
+  }
+}
