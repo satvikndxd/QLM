@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "entry_kind": "correct | adversarial | rlm_environment  (pick exactly one)",
+  "expected_verdict": "UPPER_SNAKE_CASE verdict the code's audit actually prints. correct: honest outcome (e.g. FAIL_TO_REJECT_H0). adversarial: post-audit outcome, prefixed REJECTED_ or FLAWED_.",
+  "flaws": [
+    {
+      "type": "one of: lookahead_bias | survivorship_bias | p_hacking | train_test_leakage | full_sample_fit | benchmark_snooping | cost_ignore | liquidity_ignore | regime_overfitting | selection_bias | data_snooping | multiple_testing_abuse | other",
+      "severity": "low | medium | high | fatal",
+      "location": "code_implementation:<function_name> or section name",
+      "description": "Concrete, machine-auditable statement of the planted flaw.",
+      "detection": "The exact check an auditor runs to expose it.",
+      "corrective_action": "The fix that yields the honest result."
+    }
+  ],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "<function_name>",
+        "reason": "Why this loop is mathematically necessary (recursion on t-1 state).",
+        "max_iterations": 5000
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "tool_use | multi_turn_audit | environment_interaction",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-NNNNNN-short-slug",
+    "domain": "<Domain, e.g. Statistical Arbitrage>",
+    "complexity": 5,
+    "tags": ["<tag>", "<tag>"]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "<How the agent parses the request into a testable claim. min 50 chars>",
+    "tool_selection": "<Which tools and why. min 20 chars>",
+    "recursive_delegation": "<When/whether to spawn sub-agents. min 20 chars>"
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "<H0/H1 stated mathematically, with test statistic and alpha. min 80 chars>",
+    "data_engineering": "<Seeded synthetic generator spec + real-data transfer notes. min 80 chars>",
+    "methodology_justification": "<Why this method over the alternatives. min 80 chars>",
+    "code_implementation": "<Self-contained deterministic Python, no network, exits 0, prints RESULTS block ending in the expected_verdict. min 200 chars>",
+    "statistical_validation": "<Named tests, thresholds, calibration checks against ground truth. min 80 chars>",
+    "risk_and_backtest_audit": "<Frictions modeled and NOT modeled, tail risk, regime sensitivity. min 80 chars>"
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "<Where this study most plausibly fails. min 80 chars>",
+    "falsification_strategy": "<Active attacks that should null the result. min 80 chars>",
+    "limitations": "<Hard boundaries of the methodology. min 80 chars>"
+  },
+  "agent_instructions": "<Numbered operational steps ending with the audit and calibrated report. min 100 chars>",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": ["RESULTS", "verdict="],
+    "forbid_nan_in_stdout": true,
+    "required_packages": ["numpy"]
+  }
+}

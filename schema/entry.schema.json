@@ -1,10 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qlm1.dev/schema/entry.schema.json",
-  "title": "QLM 1 / Chousorus 1 supervision dataset entry",
+  "title": "QLM 1 / Chousorus 1 supervision dataset entry (schema version 2)",
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "schema_version",
+    "entry_kind",
     "metadata",
     "agent_thought_process",
     "research_corpus",
@@ -12,6 +14,28 @@
     "agent_instructions"
   ],
   "properties": {
+    "schema_version": {
+      "const": 2,
+      "description": "Dataset schema version. All new entries must be 2; v1 entries are migrated, never dual-accepted."
+    },
+    "entry_kind": {
+      "type": "string",
+      "enum": ["correct", "adversarial", "rlm_environment"],
+      "description": "correct: rigorous execution-verified methodology. adversarial: contains declared, subtle, realistic flaws the student must detect and reject. rlm_environment: teaches recursive tool use / environment interaction."
+    },
+    "expected_verdict": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*$",
+      "description": "Machine-checkable expected outcome. For correct entries: the honest result (e.g. FAIL_TO_REJECT_H0, NO_SIGNIFICANT_EDGE). For adversarial entries: the post-audit outcome, conventionally prefixed REJECTED_ or FLAWED_."
+    },
+    "flaws": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/flaw" },
+      "description": "Every intended flaw, declared explicitly and machine-auditably. Must be non-empty for adversarial entries; must be empty (or omitted) for correct entries."
+    },
+    "static_checks": { "$ref": "#/$defs/static_checks" },
+    "rlm": { "$ref": "#/$defs/rlm" },
+    "training_sequence": { "$ref": "#/$defs/training_sequence" },
     "metadata": {
       "type": "object",
       "additionalProperties": false,
@@ -68,7 +92,7 @@
         "code_implementation": {
           "type": "string",
           "minLength": 200,
-          "description": "Self-contained, deterministic, executable Python. No network, no external data files. Must run to completion with exit code 0 and print a RESULTS block."
+          "description": "Self-contained, deterministic, executable Python. No network, no external data files. Must run to completion with exit code 0 and print a RESULTS block. Adversarial entries' code must still execute successfully — the flaw is methodological, not a crash."
         },
         "statistical_validation": { "type": "string", "minLength": 80 },
         "risk_and_backtest_audit": { "type": "string", "minLength": 80 }
@@ -106,6 +130,185 @@
           "items": { "type": "string" }
         }
       }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "entry_kind": { "const": "correct" } },
+        "required": ["entry_kind"]
+      },
+      "then": {
+        "required": ["expected_verdict"],
+        "properties": {
+          "flaws": {
+            "maxItems": 0,
+            "description": "correct entries must not declare flaws"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "entry_kind": { "const": "adversarial" } },
+        "required": ["entry_kind"]
+      },
+      "then": {
+        "required": ["expected_verdict", "flaws"],
+        "properties": {
+          "flaws": {
+            "minItems": 1,
+            "description": "adversarial entries must declare at least one concrete flaw"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "entry_kind": { "const": "rlm_environment" } },
+        "required": ["entry_kind"]
+      },
+      "then": {
+        "required": ["rlm"],
+        "properties": {
+          "rlm": {
+            "required": ["environment_class", "actions"],
+            "properties": {
+              "environment_class": {
+                "type": "string",
+                "minLength": 1,
+                "description": "must be a non-null class name for rlm_environment entries"
+              },
+              "actions": {
+                "minItems": 1,
+                "description": "rlm_environment entries must expose at least one action"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "flaw": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "severity", "location", "description", "detection", "corrective_action"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "lookahead_bias",
+            "survivorship_bias",
+            "p_hacking",
+            "train_test_leakage",
+            "full_sample_fit",
+            "benchmark_snooping",
+            "cost_ignore",
+            "liquidity_ignore",
+            "regime_overfitting",
+            "selection_bias",
+            "data_snooping",
+            "multiple_testing_abuse",
+            "other"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "fatal"]
+        },
+        "location": {
+          "type": "string",
+          "minLength": 3,
+          "description": "Where the flaw lives, e.g. 'code_implementation:zscore_positions' or 'data_engineering'."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 20,
+          "description": "Concrete statement of the flaw — no vague criticism."
+        },
+        "detection": {
+          "type": "string",
+          "minLength": 20,
+          "description": "How an auditor detects it (the check the student model must learn)."
+        },
+        "corrective_action": {
+          "type": "string",
+          "minLength": 20,
+          "description": "The fix that yields the honest result."
+        }
+      }
+    },
+    "static_checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Declarative lint contract; prepares entries for future static linting without requiring the linter now.",
+      "properties": {
+        "require_vectorized": { "type": "boolean" },
+        "forbid_pandas_row_loops": { "type": "boolean" },
+        "allowed_sequential_loops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["function", "reason", "max_iterations"],
+            "properties": {
+              "function": { "type": "string", "minLength": 1 },
+              "reason": {
+                "type": "string",
+                "minLength": 10,
+                "description": "Why the loop is mathematically necessary (e.g. an AR/GARCH recursion is inherently sequential)."
+              },
+              "max_iterations": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
+    },
+    "rlm": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Recursive-Language-Model environment contract. Minimal form for non-RLM entries: {environment_class: null, actions: [], max_recursion_depth: 1, tool_timeout_seconds: 120}.",
+      "properties": {
+        "environment_class": {
+          "type": ["string", "null"]
+        },
+        "actions": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "max_recursion_depth": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "tool_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600 }
+      }
+    },
+    "training_sequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How this entry should later be exported into an RLM training trajectory. Descriptive only — never alters research content.",
+      "properties": {
+        "style": {
+          "type": "string",
+          "enum": ["tool_use", "multi_turn_audit", "environment_interaction"]
+        },
+        "include_adversarial_critique": { "type": "boolean" },
+        "include_final_calibrated_answer": { "type": "boolean" },
+        "loss_masking": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "user": { "$ref": "#/$defs/mask_weight" },
+            "environment_observation": { "$ref": "#/$defs/mask_weight" },
+            "assistant_thought": { "$ref": "#/$defs/mask_weight" },
+            "tool_call": { "$ref": "#/$defs/mask_weight" },
+            "final_answer": { "$ref": "#/$defs/mask_weight" }
+          }
+        }
+      }
+    },
+    "mask_weight": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
     }
   }
 }

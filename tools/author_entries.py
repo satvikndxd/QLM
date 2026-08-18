@@ -955,10 +955,130 @@ ENTRY_GARCH = {
     },
 }
 
+# =====================================================================
+# Schema v1 -> v2 migration
+# =====================================================================
+#
+# Migration rules (applied verbatim, research content untouched):
+#   1. schema_version: 2
+#   2. entry_kind: "correct" for all three v1 seed entries
+#   3. expected_verdict: the honest verdict the entry's code actually prints
+#   4. flaws: []  (correct entries declare no flaws)
+#   5. minimal static_checks (loops declared only where mathematically necessary)
+#   6. minimal rlm object (no environment; recursion depth 1)
+#   7. minimal training_sequence (tool_use style, standard loss masking)
+
+MINIMAL_RLM = {
+    "environment_class": None,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120,
+}
+
+MINIMAL_TRAINING_SEQUENCE = {
+    "style": "tool_use",
+    "include_adversarial_critique": True,
+    "include_final_calibrated_answer": True,
+    "loss_masking": {
+        "user": 0.0,
+        "environment_observation": 0.0,
+        "assistant_thought": 1.0,
+        "tool_call": 1.0,
+        "final_answer": 1.0,
+    },
+}
+
+
+def migrate_v1_to_v2(
+    entry: dict,
+    entry_kind: str,
+    expected_verdict: str,
+    static_checks: dict,
+    flaws: list | None = None,
+    rlm: dict | None = None,
+    training_sequence: dict | None = None,
+) -> dict:
+    """Wrap a v1 entry into the v2 top-level structure.
+
+    The six v1 sections pass through unchanged; only the new v2 header
+    fields are prepended (dict order matches the documented v2 layout).
+    """
+    return {
+        "schema_version": 2,
+        "entry_kind": entry_kind,
+        "expected_verdict": expected_verdict,
+        "flaws": list(flaws or []),
+        "static_checks": static_checks,
+        "rlm": rlm or MINIMAL_RLM,
+        "training_sequence": training_sequence or MINIMAL_TRAINING_SEQUENCE,
+        **entry,
+    }
+
+
 ENTRIES = {
-    "001_sma_crossover.json": ENTRY_SMA,
-    "002_pairs_engle_granger.json": ENTRY_PAIRS,
-    "003_garch_qlike_dm.json": ENTRY_GARCH,
+    "001_sma_crossover.json": migrate_v1_to_v2(
+        ENTRY_SMA,
+        entry_kind="correct",
+        expected_verdict="FAIL_TO_REJECT_H0",
+        static_checks={
+            "require_vectorized": True,
+            "forbid_pandas_row_loops": True,
+            "allowed_sequential_loops": [
+                {
+                    "function": "simulate_prices",
+                    "reason": "regime-length draws are sequential until the day budget is exhausted",
+                    "max_iterations": 2520,
+                }
+            ],
+        },
+    ),
+    "002_pairs_engle_granger.json": migrate_v1_to_v2(
+        ENTRY_PAIRS,
+        entry_kind="correct",
+        expected_verdict="COINTEGRATED_TRADEABLE",
+        static_checks={
+            "require_vectorized": True,
+            "forbid_pandas_row_loops": True,
+            "allowed_sequential_loops": [
+                {
+                    "function": "simulate_pair",
+                    "reason": "AR(1) spread recursion is inherently sequential",
+                    "max_iterations": 1500,
+                }
+            ],
+        },
+    ),
+    "003_garch_qlike_dm.json": migrate_v1_to_v2(
+        ENTRY_GARCH,
+        entry_kind="correct",
+        expected_verdict="NO_SIGNIFICANT_EDGE",
+        static_checks={
+            "require_vectorized": True,
+            "forbid_pandas_row_loops": True,
+            "allowed_sequential_loops": [
+                {
+                    "function": "simulate_garch",
+                    "reason": "GARCH variance recursion is inherently sequential",
+                    "max_iterations": 3500,
+                },
+                {
+                    "function": "garch_filter",
+                    "reason": "conditional variance filter depends on sigma2[t-1]",
+                    "max_iterations": 3000,
+                },
+                {
+                    "function": "ewma_forecast",
+                    "reason": "EWMA recursion depends on s2[t-1]",
+                    "max_iterations": 3000,
+                },
+                {
+                    "function": "diebold_mariano",
+                    "reason": "HAC autocovariance sum over lags 1..DM_LAG",
+                    "max_iterations": 20,
+                },
+            ],
+        },
+    ),
 }
 
 

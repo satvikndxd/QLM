@@ -21,6 +21,29 @@ ENTRIES_DIR = REPO_ROOT / "data" / "entries"
 def _minimal_valid_entry() -> dict:
     pad = "x" * 200
     return {
+        "schema_version": 2,
+        "entry_kind": "correct",
+        "expected_verdict": "FAIL_TO_REJECT_H0",
+        "flaws": [],
+        "static_checks": {"require_vectorized": True, "forbid_pandas_row_loops": True},
+        "rlm": {
+            "environment_class": None,
+            "actions": [],
+            "max_recursion_depth": 1,
+            "tool_timeout_seconds": 120,
+        },
+        "training_sequence": {
+            "style": "tool_use",
+            "include_adversarial_critique": True,
+            "include_final_calibrated_answer": True,
+            "loss_masking": {
+                "user": 0.0,
+                "environment_observation": 0.0,
+                "assistant_thought": 1.0,
+                "tool_call": 1.0,
+                "final_answer": 1.0,
+            },
+        },
         "metadata": {"id": "qlm1-test", "domain": "Testing Domain", "complexity": 1, "tags": ["test"]},
         "agent_thought_process": {
             "initial_analysis": pad,
@@ -59,6 +82,90 @@ def test_schema_rejects_bad_complexity():
 def test_schema_rejects_missing_section():
     entry = _minimal_valid_entry()
     del entry["adversarial_critique"]
+    assert schema.validate_entry(entry)
+
+
+def _example_flaw() -> dict:
+    return {
+        "type": "lookahead_bias",
+        "severity": "fatal",
+        "location": "code_implementation:backtest",
+        "description": "Signal computed on bar t close is traded on bar t (missing .shift(1)).",
+        "detection": "Re-run with a one-bar execution lag; Sharpe collapse exposes the leak.",
+        "corrective_action": "Apply position = signal.shift(1) before computing strategy returns.",
+    }
+
+
+def test_schema_v2_accepts_adversarial_with_flaws():
+    entry = _minimal_valid_entry()
+    entry["entry_kind"] = "adversarial"
+    entry["expected_verdict"] = "REJECTED_LOOKAHEAD_BIAS"
+    entry["flaws"] = [_example_flaw()]
+    assert schema.validate_entry(entry) == []
+
+
+def test_schema_v2_rejects_adversarial_missing_flaws():
+    entry = _minimal_valid_entry()
+    entry["entry_kind"] = "adversarial"
+    entry["expected_verdict"] = "REJECTED_LOOKAHEAD_BIAS"
+    del entry["flaws"]
+    assert schema.validate_entry(entry)
+
+
+def test_schema_v2_rejects_adversarial_empty_flaws():
+    entry = _minimal_valid_entry()
+    entry["entry_kind"] = "adversarial"
+    entry["expected_verdict"] = "REJECTED_LOOKAHEAD_BIAS"
+    entry["flaws"] = []
+    assert schema.validate_entry(entry)
+
+
+def test_schema_v2_rejects_invalid_entry_kind():
+    entry = _minimal_valid_entry()
+    entry["entry_kind"] = "speculative"
+    assert schema.validate_entry(entry)
+
+
+def test_schema_v2_rejects_rlm_environment_null_class():
+    entry = _minimal_valid_entry()
+    entry["entry_kind"] = "rlm_environment"
+    entry["rlm"] = {
+        "environment_class": None,
+        "actions": ["reset"],
+        "max_recursion_depth": 3,
+        "tool_timeout_seconds": 120,
+    }
+    assert schema.validate_entry(entry)
+
+
+def test_schema_v2_rejects_rlm_environment_empty_actions():
+    entry = _minimal_valid_entry()
+    entry["entry_kind"] = "rlm_environment"
+    entry["rlm"] = {
+        "environment_class": "QuantEnvironment",
+        "actions": [],
+        "max_recursion_depth": 3,
+        "tool_timeout_seconds": 120,
+    }
+    assert schema.validate_entry(entry)
+
+
+def test_schema_v2_accepts_rlm_environment_entry():
+    entry = _minimal_valid_entry()
+    entry["entry_kind"] = "rlm_environment"
+    entry["rlm"] = {
+        "environment_class": "QuantEnvironment",
+        "actions": ["reset", "fit_train", "forecast_oos"],
+        "max_recursion_depth": 3,
+        "tool_timeout_seconds": 120,
+    }
+    del entry["expected_verdict"]  # optional for rlm_environment
+    assert schema.validate_entry(entry) == []
+
+
+def test_schema_v2_rejects_correct_with_declared_flaws():
+    entry = _minimal_valid_entry()
+    entry["flaws"] = [_example_flaw()]
     assert schema.validate_entry(entry)
 
 
