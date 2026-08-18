@@ -1,4 +1,37 @@
 {
+  "schema_version": 2,
+  "entry_kind": "correct",
+  "expected_verdict": "FAIL_TO_REJECT_H0",
+  "flaws": [],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "simulate_prices",
+        "reason": "regime-length draws are sequential until the day budget is exhausted",
+        "max_iterations": 2520
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "tool_use",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
   "metadata": {
     "id": "qlm1-000001-sma-crossover",
     "domain": "Trend Following / Time-Series Momentum",
