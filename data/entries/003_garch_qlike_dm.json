@@ -90,7 +90,7 @@
       "alpha_hat=",
       "dm_stat=",
       "dm_pvalue=",
-      "verdict="
+      "verdict=NO_SIGNIFICANT_EDGE"
     ],
     "forbid_nan_in_stdout": true,
     "required_packages": [

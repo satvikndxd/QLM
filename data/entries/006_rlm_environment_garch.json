@@ -1,0 +1,113 @@
+{
+  "schema_version": 2,
+  "entry_kind": "rlm_environment",
+  "expected_verdict": "ENVIRONMENT_VERIFIED",
+  "flaws": [],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "_simulate_garch",
+        "reason": "GARCH variance recursion is inherently sequential",
+        "max_iterations": 3500
+      },
+      {
+        "function": "_garch_filter",
+        "reason": "conditional variance filter depends on s2[t-1]",
+        "max_iterations": 3000
+      },
+      {
+        "function": "QuantEnvironment._do_forecast_oos",
+        "reason": "EWMA benchmark recursion depends on e2[t-1]",
+        "max_iterations": 3000
+      },
+      {
+        "function": "QuantEnvironment._do_run_dm_test",
+        "reason": "HAC autocovariance sum over lags 1..DM_LAG",
+        "max_iterations": 10
+      },
+      {
+        "function": "main",
+        "reason": "agent action loop: each step depends on the previous observation",
+        "max_iterations": 7
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": "QuantEnvironment",
+    "actions": [
+      "reset",
+      "fit_train",
+      "forecast_oos",
+      "evaluate_qlike",
+      "run_dm_test"
+    ],
+    "max_recursion_depth": 3,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "environment_interaction",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000006-rlm-environment-garch",
+    "domain": "Volatility Modeling / Environment Interaction",
+    "complexity": 8,
+    "tags": [
+      "rlm",
+      "environment",
+      "tool-use",
+      "state-machine",
+      "garch",
+      "qlike",
+      "diebold-mariano",
+      "error-recovery",
+      "deterministic-replay"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "The task is not 'forecast volatility' but 'conduct the forecasting study THROUGH an environment': every research step is an action whose result arrives as an observation, and the next action must be chosen from the observation, not from a memorized script. The plan contains ordering mistakes on purpose — fit before reset, evaluate before forecast — because the behavior worth learning is reading {'ok': False, 'error': ...} and re-planning, not assuming success. State lives in the environment, not the agent: the agent's memory is the observation trace.",
+    "tool_selection": "Python REPL hosting the environment class; numpy/scipy inside the environment for GARCH QMLE, forecasting, QLIKE, and the DM test; json for the observation protocol — every observation must round-trip through json.dumps/loads, because a real RLM agent consumes observations as serialized tool output, never as live Python objects.",
+    "recursive_delegation": "The environment is the delegation boundary: a parent agent can hand a sub-agent the environment handle plus a goal ('produce a DM verdict') and judge it purely on the observation trace. Recursion depth 3 covers parent -> research sub-agent -> verification sub-agent replaying the trace against a fresh seeded environment to confirm determinism — the replay check in the code is exactly that verification step, performed inline."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "Environment-level hypotheses (the research content — GARCH vs EWMA under QLIKE with a DM test — inherits its H0/H1 from entry qlm1-000003): H0-env: the environment is NOT a faithful research instrument — it permits invalid action orderings, returns non-serializable or non-finite observations, or replays non-deterministically. H1-env: all guards hold, all observations are JSON-round-trippable and finite, the full action sequence is reachable after error recovery, and an identical seeded environment replays the exact trace. Verdict ENVIRONMENT_VERIFIED requires every check to pass; a single failure yields ENVIRONMENT_BROKEN.",
+    "data_engineering": "Data is generated INSIDE the environment on reset(): 3000 days of seeded GARCH(1,1) returns in percent units (burn-in 500 discarded), train/test split 2000/1000 fixed by the environment, not the agent — so no agent action can move the split boundary and leak test data into fitting. Observations expose only aggregates (sample variance, parameter estimates, mean forecasts, losses), never raw future returns, which is the information-hygiene property that makes the environment safe to hand to an untrusted optimizing agent.",
+    "methodology_justification": "A state machine with explicit preconditions (reset -> fitted -> forecasted -> evaluated -> tested) is chosen over free function calls because ordering IS the methodology in walk-forward research: forecasting before fitting or evaluating before forecasting are not programming errors but research errors, and the environment encodes them as such. Guards return error observations instead of raising, because exception-crashing teaches the agent nothing — observation-driven recovery is the trainable behavior. The embedded quant methodology (Gaussian QMLE via Nelder-Mead, frozen-parameter OOS forecasts, QLIKE, DM with Bartlett HAC) is inherited unchanged from the verified correct entry qlm1-000003, so this entry adds interaction structure, not new statistical claims.",
+    "code_implementation": "\"\"\"RLM TEACHING ENTRY: quantitative research as ENVIRONMENT INTERACTION.\n\nInstead of a monolithic script, the research workflow is exposed as a\nstateful environment with a gym-like reset/step API. The agent must:\n\n  inspect -> act -> read observation -> decide next action -> verify\n\nTwo actions in the scripted plan are deliberately out of order; the\nenvironment refuses them with error observations instead of raising, and\nthe agent recovers by reordering — teaching observation-driven control\nflow rather than script-following. All observations are JSON-serializable\ndicts. Deterministic (seeded); replay is verified.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\n\nimport numpy as np\nfrom scipy import stats\nfrom scipy.optimize import minimize\n\nRNG_SEED = 123\nN_TOTAL, N_BURN, N_TRAIN = 3000, 500, 2000\nTRUE_OMEGA, TRUE_ALPHA, TRUE_BETA = 0.05, 0.08, 0.90   # percent^2 units\nEWMA_LAMBDA = 0.94\nVAR_FLOOR = 1e-8\nDM_LAG = 10\n\n\ndef _simulate_garch(n: int, burn: int, seed: int) -> np.ndarray:\n    \"\"\"Seeded GARCH(1,1) returns in percent units; burn-in discarded.\"\"\"\n    rng = np.random.default_rng(seed)\n    z = rng.standard_normal(n + burn)\n    sigma2 = np.empty(n + burn)\n    r = np.empty(n + burn)\n    sigma2[0] = TRUE_OMEGA / (1.0 - TRUE_ALPHA - TRUE_BETA)\n    r[0] = np.sqrt(sigma2[0]) * z[0]\n    for t in range(1, n + burn):       # GARCH recursion: inherently sequential\n        sigma2[t] = TRUE_OMEGA + TRUE_ALPHA * r[t - 1] ** 2 + TRUE_BETA * sigma2[t - 1]\n        r[t] = np.sqrt(sigma2[t]) * z[t]\n    return r[burn:]\n\n\ndef _garch_filter(r: np.ndarray, omega: float, alpha: float, beta: float) -> np.ndarray:\n    n = len(r)\n    s2 = np.empty(n)\n    s2[0] = max(r.var(), VAR_FLOOR)\n    for t in range(1, n):              # depends on s2[t-1]: sequential by nature\n        s2[t] = max(omega + alpha * r[t - 1] ** 2 + beta * s2[t - 1], VAR_FLOOR)\n    return s2\n\n\ndef _neg_loglik(params: np.ndarray, r: np.ndarray) -> float:\n    omega, alpha, beta = params\n    if omega <= 0.0 or alpha < 0.0 or beta < 0.0 or alpha + beta >= 0.999:\n        return 1e10                    # infeasible region: reject cheaply\n    s2 = _garch_filter(r, omega, alpha, beta)\n    return float(0.5 * (np.log(2.0 * np.pi) + np.log(s2) + r**2 / s2).sum())\n\n\nclass QuantEnvironment:\n    \"\"\"Stateful volatility-research environment.\n\n    API: obs = env.step({\"name\": <action>}). Observations are plain\n    dicts (JSON-serializable). Precondition violations return\n    {\"ok\": False, \"error\": ...} — the environment NEVER raises for a\n    bad action ordering, because the agent is supposed to read\n    observations and re-plan, not crash.\n    \"\"\"\n\n    ACTIONS = (\"reset\", \"fit_train\", \"forecast_oos\", \"evaluate_qlike\", \"run_dm_test\")\n\n    def __init__(self, seed: int = RNG_SEED):\n        self._seed = seed\n        self._state = \"uninitialized\"\n        self._r = None\n        self._fit = None\n        self._s2_garch = None\n        self._s2_ewma = None\n        self._ql = None\n\n    def reset(self) -> dict:\n        self._r = _simulate_garch(N_TOTAL, N_BURN, self._seed)\n        self._fit = None\n        self._s2_garch = None\n        self._s2_ewma = None\n        self._ql = None\n        self._state = \"reset\"\n        return {\"ok\": True, \"state\": self._state, \"n_obs\": int(len(self._r)),\n                \"n_train\": N_TRAIN, \"sample_var\": round(float(self._r.var()), 4)}\n\n    def step(self, action: dict) -> dict:\n        name = action.get(\"name\")\n        if name not in self.ACTIONS:\n            return {\"ok\": False, \"error\": f\"unknown action: {name}\", \"state\": self._state}\n        if name == \"reset\":\n            return self.reset()\n        if self._state == \"uninitialized\":\n            return {\"ok\": False, \"error\": \"call reset first\", \"state\": self._state}\n        return getattr(self, f\"_do_{name}\")(action)\n\n    def _do_fit_train(self, action: dict) -> dict:\n        r_train = self._r[:N_TRAIN]\n        x0 = np.array([r_train.var() * 0.05, 0.10, 0.85])   # variance-targeted start\n        res = minimize(_neg_loglik, x0, args=(r_train,), method=\"Nelder-Mead\",\n                       options={\"xatol\": 1e-6, \"fatol\": 1e-6, \"maxiter\": 5000})\n        omega, alpha, beta = (float(v) for v in res.x)\n        self._fit = {\"omega\": omega, \"alpha\": alpha, \"beta\": beta}\n        self._state = \"fitted\"\n        return {\"ok\": True, \"state\": self._state,\n                \"params\": {\"omega\": round(omega, 4), \"alpha\": round(alpha, 4),\n                           \"beta\": round(beta, 4)},\n                \"persistence\": round(alpha + beta, 4), \"converged\": bool(res.success)}\n\n    def _do_forecast_oos(self, action: dict) -> dict:\n        if self._fit is None:\n            return {\"ok\": False, \"error\": \"fit_train before forecast_oos\", \"state\": self._state}\n        s2 = _garch_filter(self._r, self._fit[\"omega\"], self._fit[\"alpha\"], self._fit[\"beta\"])\n        self._s2_garch = s2[N_TRAIN:]                       # frozen-parameter OOS\n        e2 = np.empty(len(self._r))\n        e2[0] = max(self._r[:50].var(), VAR_FLOOR)\n        for t in range(1, len(self._r)):                    # EWMA recursion: sequential\n            e2[t] = max(EWMA_LAMBDA * e2[t - 1] + (1.0 - EWMA_LAMBDA) * self._r[t - 1] ** 2,\n                        VAR_FLOOR)\n        self._s2_ewma = e2[N_TRAIN:]\n        self._state = \"forecasted\"\n        return {\"ok\": True, \"state\": self._state, \"n_forecasts\": int(len(self._s2_garch)),\n                \"garch_mean_var\": round(float(self._s2_garch.mean()), 4),\n                \"ewma_mean_var\": round(float(self._s2_ewma.mean()), 4)}\n\n    def _do_evaluate_qlike(self, action: dict) -> dict:\n        if self._s2_garch is None:\n            return {\"ok\": False, \"error\": \"forecast_oos before evaluate_qlike\",\n                    \"state\": self._state}\n        r2 = self._r[N_TRAIN:] ** 2\n        ql_g = np.log(self._s2_garch) + r2 / self._s2_garch\n        ql_e = np.log(self._s2_ewma) + r2 / self._s2_ewma\n        self._ql = (ql_g, ql_e)\n        self._state = \"evaluated\"\n        return {\"ok\": True, \"state\": self._state,\n                \"qlike_garch\": round(float(ql_g.mean()), 5),\n                \"qlike_ewma\": round(float(ql_e.mean()), 5)}\n\n    def _do_run_dm_test(self, action: dict) -> dict:\n        if self._ql is None:\n            return {\"ok\": False, \"error\": \"evaluate_qlike before run_dm_test\",\n                    \"state\": self._state}\n        d = self._ql[0] - self._ql[1]\n        n = len(d)\n        u = d - d.mean()\n        var_hac = float(u @ u) / n\n        for k in range(1, DM_LAG + 1):                      # HAC lag sum: bounded loop\n            var_hac += 2.0 * (1.0 - k / (DM_LAG + 1.0)) * float(u[k:] @ u[:-k]) / n\n        var_hac = max(var_hac, VAR_FLOOR)\n        dm = float(d.mean() / np.sqrt(var_hac / n))\n        p = float(2.0 * (1.0 - stats.norm.cdf(abs(dm))))\n        self._state = \"tested\"\n        return {\"ok\": True, \"state\": self._state, \"dm_stat\": round(dm, 3),\n                \"dm_pvalue\": round(p, 5),\n                \"conclusion\": \"GARCH_BEATS_EWMA\" if (dm < 0 and p < 0.05)\n                else \"NO_SIGNIFICANT_EDGE\"}\n\n\ndef main() -> None:\n    env = QuantEnvironment(seed=RNG_SEED)\n    # Scripted agent plan with TWO deliberate ordering mistakes: the agent\n    # must read the error observations and recover, not crash.\n    plan = [\n        {\"name\": \"fit_train\"},        # invalid: environment not reset yet\n        {\"name\": \"reset\"},\n        {\"name\": \"fit_train\"},\n        {\"name\": \"evaluate_qlike\"},   # invalid: nothing forecasted yet\n        {\"name\": \"forecast_oos\"},\n        {\"name\": \"evaluate_qlike\"},\n        {\"name\": \"run_dm_test\"},\n    ]\n    executed = []\n    guard_failures = 0\n    obs = None\n    for action in plan:\n        obs = env.step(action)\n        print(f\"trace={json.dumps({'action': action['name'], 'observation': obs}, sort_keys=True)}\")\n        if obs[\"ok\"]:\n            executed.append(action[\"name\"])\n        else:\n            guard_failures += 1\n\n    # Environment verification battery.\n    checks = {\n        \"guards_rejected_both_unordered_actions\": guard_failures == 2,\n        \"recovered_full_action_sequence\": executed == list(QuantEnvironment.ACTIONS),\n        \"final_observation_json_roundtrip\": json.loads(json.dumps(obs)) == obs,\n        \"dm_stat_finite\": bool(obs[\"ok\"] and np.isfinite(obs[\"dm_stat\"])),\n        \"honest_conclusion_preserved\": obs.get(\"conclusion\") == \"NO_SIGNIFICANT_EDGE\",\n    }\n    # Determinism: an identical fresh environment must replay identically.\n    env2 = QuantEnvironment(seed=RNG_SEED)\n    obs2 = None\n    for action in plan:\n        obs2 = env2.step(action)\n    checks[\"deterministic_replay\"] = obs == obs2\n\n    print(\"RESULTS\")\n    print(\"environment_class=QuantEnvironment\")\n    print(f\"actions_executed={','.join(executed)}\")\n    print(f\"guard_failures_handled={guard_failures}\")\n    for name, passed in checks.items():\n        print(f\"check_{name}={passed}\")\n    print(f\"final_observation={json.dumps(obs, sort_keys=True)}\")\n    verdict = \"ENVIRONMENT_VERIFIED\" if all(checks.values()) else \"ENVIRONMENT_BROKEN\"\n    print(f\"verdict={verdict}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Six machine-checked environment invariants, all printed as check_* lines: (1) both deliberately unordered actions rejected by guards; (2) the full five-action sequence completes after recovery; (3) the final observation survives a json round-trip; (4) the DM statistic is finite; (5) the environment's conclusion equals NO_SIGNIFICANT_EDGE — the honest verdict inherited from the underlying study (dm_stat ~ -1.127, p ~ 0.26), so the interaction wrapper preserves calibrated uncertainty rather than manufacturing a win; (6) deterministic replay: a fresh environment with the same seed reproduces the final observation exactly. The verdict is the conjunction of all six.",
+    "risk_and_backtest_audit": "Environment-specific risks replace market frictions here: (a) state leakage — a buggy environment that lets evaluate_qlike run before forecast_oos would silently score in-sample fits as OOS; the guard tests exist to catch exactly this class; (b) nondeterminism — an environment that draws fresh randomness per step makes agent trajectories unreproducible and RLM training data worthless, hence the replay check; (c) observation overflow — returning raw arrays would blow up serialized traces and leak future data; observations are capped to scalar aggregates; (d) the timeout contract (120s) bounds the cost of any single action so a stuck optimizer cannot hang a training-data generation run."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) A scripted plan that happens to be in the right order would pass without demonstrating recovery — the deliberate mistakes are load-bearing; removing them silently weakens the entry to a monolithic script with extra steps. (2) Guards that raise exceptions instead of returning error observations would still 'work' in this driver but teach crash-on-error to the student model. (3) Rounding observations to 4-5 decimals is required for stable replay comparison, but over-aggressive rounding could mask real nondeterminism — the replay check compares the rounded dicts, so keep rounding no coarser than shown. (4) The environment's honest NO_SIGNIFICANT_EDGE conclusion must never be 'fixed' to a win to make the trace look more satisfying — that would smuggle motivated reasoning into the RLM corpus.",
+    "falsification_strategy": "Break the environment on purpose and confirm the battery catches it: (a) remove the fit_train guard — check 1 fails and the verdict flips to ENVIRONMENT_BROKEN; (b) inject a fresh random seed per reset — the replay check fails; (c) return the raw returns array in an observation — the json round-trip stays technically true but trace size explodes: add a size budget assertion when scaling; (d) flip the DM conclusion logic — check 5 fails, proving the wrapper cannot silently change the underlying study's verdict.",
+    "limitations": "The scripted plan exercises one error-recovery path; a full RLM curriculum needs many plans (shuffled orders, repeated actions, unknown action names) over the same environment — this entry is the template, not the coverage. The environment exposes a single fixed DGP and split; parameterized resets (seed, split point as action arguments) are the natural extension but were kept out to keep the verification battery exact. Observations are scalar aggregates, so an agent cannot request diagnostics (residual plots, subsample losses) — richer read-only inspection actions are future work."
+  },
+  "agent_instructions": "1. Instantiate QuantEnvironment with the fixed seed; do not generate data outside it. 2. Submit actions ONLY via env.step({'name': ...}); after every step, parse the observation and branch on obs['ok'] — on False, read obs['error'], do not retry blindly, and re-order the plan to satisfy the stated precondition. 3. Drive the sequence to completion: reset, fit_train, forecast_oos, evaluate_qlike, run_dm_test. 4. Log every (action, observation) pair as a json trace line — the trace IS the research record. 5. Run the verification battery: guard rejections counted, full sequence reached, json round-trip, finite statistics, honest conclusion preserved, deterministic replay on a fresh same-seed environment. 6. Emit verdict=ENVIRONMENT_VERIFIED only if every check passes; any failure is ENVIRONMENT_BROKEN with the failing check named. 7. Report the environment's statistical conclusion exactly as observed (NO_SIGNIFICANT_EDGE) — the wrapper must never editorialize the underlying result.",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": [
+      "RESULTS",
+      "environment_class=QuantEnvironment",
+      "actions_executed=reset,fit_train,forecast_oos,evaluate_qlike,run_dm_test",
+      "guard_failures_handled=2",
+      "check_deterministic_replay=True",
+      "final_observation=",
+      "verdict=ENVIRONMENT_VERIFIED"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "scipy"
+    ]
+  }
+}
