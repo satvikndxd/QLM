@@ -1,0 +1,99 @@
+{
+  "schema_version": 2,
+  "entry_kind": "correct",
+  "expected_verdict": "TAIL_DEPENDENCE_VERIFIED",
+  "flaws": [],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "pairwise_lambda_hat",
+        "reason": "loop over the 3 ordered asset pairs; each pair's conditional tail probability is a vectorized boolean reduction",
+        "max_iterations": 3
+      },
+      {
+        "function": "main",
+        "reason": "loop over the 4 tail quantiles for the lambda dose-response profile; each estimate is vectorized over 100k simulations",
+        "max_iterations": 8
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "tool_use",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000016-copula-tail",
+    "domain": "Risk Modeling / Multivariate Dependence",
+    "complexity": 7,
+    "tags": [
+      "copula",
+      "tail-dependence",
+      "gaussian-copula",
+      "student-t-copula",
+      "joint-extremes",
+      "asymptotic-independence",
+      "monte-carlo",
+      "chi-squared-mixing",
+      "correlation-vs-dependence"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "The question 'does the Gaussian copula understate joint crashes?' must be operationalized as a controlled comparison: hold the correlation matrix AND the marginals fixed, vary ONLY the copula, and measure the probability that all three assets breach their 2-sigma quantiles simultaneously. Two falsifiable signatures separate the dependence classes: (a) the t-copula's joint tail probability strictly dominates the Gaussian's and the ratio GROWS with tail depth (2.35x at 2-sigma, 5.1x at 2.5-sigma) — a fixed calibration offset cannot produce a growing ratio; (b) the empirical pairwise tail-dependence estimate decays toward zero with the quantile under the Gaussian (asymptotic independence) while stabilizing near the closed-form lambda = 2*t_{nu+1}(-sqrt((nu+1)(1-rho)/(1+rho))) under the t.",
+    "tool_selection": "Python REPL with numpy for the 100k-path simulation (Cholesky factor shared by both copulas; the t adds one chi-squared mixing draw per day) and scipy.stats for norm/t CDFs and the closed-form lambda. No copula library — building both from primitives is the lesson.",
+    "recursive_delegation": "Not needed at 3 assets. A book-level dependence audit (hundreds of pairs) would delegate per-block lambda estimation to sub-agents while the parent owns the copula-family decision, because tail-dependence evidence aggregates into ONE modeling choice that must be consistent book-wide."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "H0 (all must hold for TAIL_DEPENDENCE_VERIFIED): (a) both copulas realize the target correlation 0.5 within 0.02 on normal-score scale (fair comparison certified); (b) both joint 2-sigma crash probabilities exceed the independence benchmark u^3 = 1.18e-5 (positive dependence real in both); (c) t-copula joint probability > 2x Gaussian at 2-sigma AND the ratio at 2.5-sigma exceeds both the 2-sigma ratio and 3.0 (divergence grows with depth); (d) empirical Gaussian lambda-hat decays from q=5% to q=0.5% while the t lambda-hat stays above half the closed-form value and below 1.5x of it, and exceeds 2x the Gaussian estimate at the deepest quantile. Any failure yields TAIL_CHECKS_FAILED.",
+    "data_engineering": "100,000 seeded days for each copula sharing one Cholesky factor of the equicorrelation matrix (rho=0.5, 3 assets). Gaussian: U = Phi(Z). Student-t (nu=4): U = T_nu(Z*sqrt(nu/W)) with a SINGLE chi-squared mixing variable W per day shared across assets — that shared shock is the structural source of tail dependence, and building it explicitly (rather than calling a copula library) is the pedagogical choice. Working on copula scale (uniforms) makes the comparison marginal-free; the 2-sigma threshold maps to the u = Phi(-2) = 0.02275 quantile of any marginal. On real data this step corresponds to fitting marginals first (e.g. skew-t), transforming to pseudo-uniforms by ranks, and only then asking the copula question.",
+    "methodology_justification": "The comparison is engineered so exactly one thing varies: same correlation target (verified empirically at 0.490 vs 0.493), same marginals by construction, different copula. The joint 3-asset crash probability is the portfolio-relevant statistic (all positions down together); the pairwise lambda profile across shrinking quantiles is the diagnostic that identifies WHY — Gaussian dependence weakens as you condition deeper into the tail (lambda = 0 in the limit for rho < 1), while the t-copula's chi-squared mixing keeps tails coupled (lambda = 0.253 at rho=0.5, nu=4). Reporting BOTH the moderate-tail ratio (2.35x) and the deep-tail ratio (5.1x) is deliberate honesty: at 2-sigma the Gaussian copula is wrong by a factor, not an order of magnitude — the order-of-magnitude error develops asymptotically, which is precisely the asymptotic-independence trap.",
+    "code_implementation": "\"\"\"Gaussian vs Student-t copula for a 3-asset portfolio: joint extreme\nevents under identical correlation matrices.\n\nLessons encoded: (1) Correlation is not dependence — two copulas with\nthe SAME pairwise correlation matrix and the SAME marginals can differ\nby an order of magnitude in the probability that all three assets crash\ntogether, because the Gaussian copula is asymptotically independent in\nthe tails (its tail-dependence coefficient is exactly zero for rho < 1)\nwhile the Student-t copula has strictly positive tail dependence\nlambda = 2 * t_{nu+1}(-sqrt((nu+1)(1-rho)/(1+rho))). (2) The empirical\ntail-dependence estimate under the Gaussian copula must DECAY toward\nzero as the quantile shrinks, while the t-copula estimate stabilizes\nnear its closed-form lambda — the dose-response signature that separates\nthe two dependence classes in finite samples. Portfolio construction,\nCDO pricing, and stress testing that assume Gaussian dependence\nsystematically understate joint crash risk. Deterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nfrom scipy import stats\n\nRNG_SEED = 16\nN_SIMS = 100_000\nN_ASSETS = 3\nRHO = 0.5                    # common pairwise correlation\nT_DF = 4                     # t-copula degrees of freedom (heavy tail dep)\nZ_THRESHOLD = -2.0           # 'all three drop > 2 sigma simultaneously'\nZ_THRESHOLD_DEEP = -2.5      # deeper joint crash: the divergence GROWS\nTAIL_QS = (0.05, 0.02, 0.01, 0.005)   # quantiles for the lambda estimates\n\n\ndef correlation_matrix(rho: float) -> np.ndarray:\n    return (1.0 - rho) * np.eye(N_ASSETS) + rho * np.ones((N_ASSETS, N_ASSETS))\n\n\ndef gaussian_copula_uniforms(rng: np.ndarray, chol: np.ndarray) -> np.ndarray:\n    \"\"\"U = Phi(Z), Z ~ N(0, R): the Gaussian dependence structure.\"\"\"\n    z = rng.standard_normal((N_SIMS, N_ASSETS)) @ chol.T\n    return stats.norm.cdf(z)\n\n\ndef t_copula_uniforms(rng: np.ndarray, chol: np.ndarray) -> np.ndarray:\n    \"\"\"U = T_nu(Z * sqrt(nu/W)), W ~ chi2(nu): one shared mixing variable\n    couples all three tails — the source of tail dependence.\"\"\"\n    z = rng.standard_normal((N_SIMS, N_ASSETS)) @ chol.T\n    w = rng.chisquare(T_DF, N_SIMS)\n    t = z * np.sqrt(T_DF / w)[:, None]\n    return stats.t.cdf(t, df=T_DF)\n\n\ndef theoretical_t_lambda(rho: float, nu: int) -> float:\n    \"\"\"Closed-form pairwise tail-dependence coefficient of the t-copula.\"\"\"\n    arg = -np.sqrt((nu + 1.0) * (1.0 - rho) / (1.0 + rho))\n    return float(2.0 * stats.t.cdf(arg, df=nu + 1))\n\n\ndef joint_tail_prob(u: np.ndarray, u_threshold: float) -> float:\n    \"\"\"Empirical probability that ALL assets are below the threshold\n    quantile simultaneously (copula scale — marginal-free).\"\"\"\n    return float((u < u_threshold).all(axis=1).mean())\n\n\ndef pairwise_lambda_hat(u: np.ndarray, q: float) -> float:\n    \"\"\"Empirical lower-tail dependence P(U2<q | U1<q), averaged over the\n    three ordered pairs.\"\"\"\n    vals = []\n    for i, j in ((0, 1), (0, 2), (1, 2)):    # 3 asset pairs\n        base = u[:, i] < q\n        vals.append((base & (u[:, j] < q)).sum() / max(base.sum(), 1))\n    return float(np.mean(vals))\n\n\ndef main() -> None:\n    rng = np.random.default_rng(RNG_SEED)\n    chol = np.linalg.cholesky(correlation_matrix(RHO))\n    u_gauss = gaussian_copula_uniforms(rng, chol)\n    u_t = t_copula_uniforms(rng, chol)\n\n    # Same marginal correlation target for both, verified empirically on\n    # normal-score scale so the comparison is copula-vs-copula only.\n    z_g = stats.norm.ppf(u_gauss)\n    z_t = stats.norm.ppf(u_t)\n    corr_g = float(np.corrcoef(z_g, rowvar=False)[0, 1])\n    corr_t = float(np.corrcoef(z_t, rowvar=False)[0, 1])\n\n    # Joint crash: all three below the 2-sigma marginal quantile.\n    u_thr = float(stats.norm.cdf(Z_THRESHOLD))\n    p_gauss = joint_tail_prob(u_gauss, u_thr)\n    p_t = joint_tail_prob(u_t, u_thr)\n    u_deep = float(stats.norm.cdf(Z_THRESHOLD_DEEP))\n    p_gauss_deep = joint_tail_prob(u_gauss, u_deep)\n    p_t_deep = joint_tail_prob(u_t, u_deep)\n    p_indep = u_thr ** N_ASSETS\n    lam_theory = theoretical_t_lambda(RHO, T_DF)\n    ratio = p_t / max(p_gauss, 1e-12)\n    ratio_deep = p_t_deep / max(p_gauss_deep, 1e-12)\n\n    print(\"RESULTS\")\n    print(f\"n_sims={N_SIMS}\")\n    print(f\"rho={RHO}\")\n    print(f\"t_df={T_DF}\")\n    print(f\"threshold_quantile={u_thr:.5f}\")\n    print(f\"realized_corr_gaussian={corr_g:.3f}\")\n    print(f\"realized_corr_student_t={corr_t:.3f}\")\n    print(f\"independent_joint_tail_prob={p_indep:.2e}\")\n    print(f\"gaussian_joint_tail_prob={p_gauss:.2e}\")\n    print(f\"student_t_joint_tail_prob={p_t:.2e}\")\n    print(f\"tail_prob_ratio_t_over_gaussian={ratio:.2f}\")\n    print(f\"gaussian_joint_tail_prob_2p5sigma={p_gauss_deep:.2e}\")\n    print(f\"student_t_joint_tail_prob_2p5sigma={p_t_deep:.2e}\")\n    print(f\"tail_prob_ratio_2p5sigma={ratio_deep:.2f}\")\n    print(f\"theoretical_gaussian_tail_lambda=0.0\")\n    print(f\"theoretical_t_tail_lambda={lam_theory:.4f}\")\n\n    lam_g = [pairwise_lambda_hat(u_gauss, q) for q in TAIL_QS]\n    lam_t = [pairwise_lambda_hat(u_t, q) for q in TAIL_QS]\n    for q, lg, lt in zip(TAIL_QS, lam_g, lam_t):\n        print(f\"lambda_hat_q{q}_gaussian={lg:.4f}\")\n        print(f\"lambda_hat_q{q}_student_t={lt:.4f}\")\n\n    checks = {\n        # Both copulas hit the same correlation target (fair comparison).\n        \"correlations_match\": abs(corr_g - corr_t) < 0.02\n                              and abs(corr_g - RHO) < 0.02,\n        # Both exceed independence (positive dependence is real in both).\n        \"both_exceed_independence\": p_gauss > p_indep and p_t > p_indep,\n        # The t-copula joint crash probability dominates the Gaussian one,\n        # and the underestimation GROWS with tail depth — the signature of\n        # asymptotic independence, not a fixed calibration offset.\n        \"t_dominates_gaussian_joint_tail\": p_t > 2.0 * p_gauss,\n        \"divergence_grows_with_depth\": ratio_deep > ratio\n                                       and ratio_deep > 3.0,\n        # Gaussian lambda decays toward zero as q shrinks (asymptotic\n        # independence); t lambda does not decay below half its theory value.\n        \"gaussian_lambda_decays\": lam_g[-1] < lam_g[0],\n        \"t_lambda_stabilizes\": lam_t[-1] > 0.5 * lam_theory,\n        # Deepest-quantile separation: t lambda at q=0.5% is far above Gaussian.\n        \"t_lambda_exceeds_gaussian_deep_tail\": lam_t[-1] > 2.0 * lam_g[-1],\n        # Empirical t lambda at the deepest quantile is approaching, and\n        # remains below ~1.5x of, the closed-form asymptotic value.\n        \"t_lambda_near_theory\": lam_t[-1] < 1.5 * lam_theory,\n    }\n    for name, passed in checks.items():\n        print(f\"check_{name}={passed}\")\n    ok = all(checks.values())\n    print(f\"verdict={'TAIL_DEPENDENCE_VERIFIED' if ok else 'TAIL_CHECKS_FAILED'}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at seed 16: realized correlations 0.490/0.493 vs target 0.5; joint 2-sigma crash probability 1.42e-3 (Gaussian) vs 3.34e-3 (t), ratio 2.35, both far above the 1.18e-5 independence benchmark; at 2.5-sigma the ratio grows to 5.06 (1.60e-4 vs 8.10e-4); Gaussian lambda-hat decays 0.235 -> 0.095 from q=5% to q=0.5% while the t lambda-hat holds at 0.291 vs closed-form 0.253. Cross-seed robustness at {1, 7, 16, 42, 99, 2026}: all eight checks pass in every seed, with the deep-tail ratio ranging 3.7-6.6 — Poisson counting noise at ~16-80 joint events never flips a check.",
+    "risk_and_backtest_audit": "Modeled: identical marginals and correlations, explicit mixing construction, dose-response diagnostics, closed-form cross-check. NOT modeled: time-varying correlation (real crises raise rho AND tail dependence simultaneously — this entry isolates the copula channel at fixed rho), asymmetric tail dependence (the t-copula is symmetric; equity data show stronger LOWER-tail dependence, motivating Clayton/skew-t copulas in production), estimation risk of nu from finite samples (nu and rho trade off in likelihood; tail-implied calibration differs from MLE), and marginal misspecification (a wrong marginal contaminates the pseudo-uniforms before any copula is fit). Portfolio implication: Gaussian-copula VaR aggregation understates joint-crash capital by the measured factors, and the understatement grows exactly where capital matters — deeper in the tail; the 2008 CDO experience is the canonical realization of this arithmetic."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The classic conflation: 'we correlated the assets at 0.5, dependence is handled' — correlation fixes the copula's body, not its tails; two models with identical correlation matrices differ 5x in deep-tail joint crash probability here. (2) Empirical lambda-hat at finite quantiles is biased UP for the Gaussian (it only reaches 0 asymptotically), so a naive reading of lambda-hat(5%) = 0.24 suggests tail dependence where there is none in the limit — the DECAY across quantiles, not the level, is the diagnostic. (3) At 100k sims the deepest-quantile estimates rest on ~500 conditioning events; pushing q much lower without more paths produces noise dressed as signal. (4) A single shared mixing variable ties ALL assets' tails together; for large books this overstates joint-crash coupling versus grouped-t constructions with sector-level mixing.",
+    "falsification_strategy": "(a) Set nu very large (e.g. 200): the t-copula converges to the Gaussian, so the joint-tail ratio must fall toward 1 and the divergence check must FAIL — confirming the detector measures tail dependence, not simulation artifacts. (b) Set rho=0: both copulas' joint probabilities must approach the independence benchmark (the t retains a small mixing effect — itself a teachable residual). (c) Swap the chi-squared mixing to be INDEPENDENT per asset: tail dependence vanishes despite identical marginals, isolating the shared-shock mechanism. (d) Double the simulation count and confirm every empirical estimate moves toward its theoretical target rather than away — the Monte Carlo is converging, not lucky.",
+    "limitations": "Equicorrelation with 3 assets is the minimal joint-tail laboratory; real dependence structures need hierarchical or vine copulas and this entry's checks do not certify those. The t-copula is symmetric in upper and lower tails — it captures THAT tails couple, not the empirical asymmetry of crashes versus rallies. All statements are about the copula at fixed marginals; total portfolio tail risk compounds marginal fatness (entry 009's territory) with dependence (this entry's), and the two are frequently confused. Closed-form lambda is a pairwise asymptotic statement; the 3-asset joint probability has no elementary closed form and is certified here only by Monte Carlo against its qualitative theory."
+  },
+  "agent_instructions": "1. Build the equicorrelation matrix (rho=0.5) and its Cholesky factor once; simulate 100k Gaussian-copula days and 100k t-copula days (nu=4) with the shared factor and a per-day chi-squared mixing variable for the t. 2. Verify both copulas realize the target correlation within 0.02 on normal-score scale — the fair-comparison certificate. 3. Compute joint crash probabilities (all three below the 2-sigma quantile) for both copulas and the independence benchmark; then repeat at 2.5-sigma and confirm the t/Gaussian ratio GROWS with depth and exceeds 3. 4. Estimate the pairwise lower-tail lambda profile at q in {5%, 2%, 1%, 0.5%}; confirm Gaussian decay and t stabilization near the closed-form lambda. 5. Emit verdict=TAIL_DEPENDENCE_VERIFIED only if every check passes. 6. Report the practical translation: Gaussian-copula capital for joint crashes is understated by the measured factors, increasingly so deeper in the tail; recommend t or asymmetric copulas wherever joint extremes drive the risk number.",
+  "verification": {
+    "timeout_seconds": 240,
+    "must_print": [
+      "RESULTS",
+      "n_sims=100000",
+      "gaussian_joint_tail_prob=",
+      "student_t_joint_tail_prob=",
+      "tail_prob_ratio_t_over_gaussian=",
+      "tail_prob_ratio_2p5sigma=",
+      "theoretical_gaussian_tail_lambda=0.0",
+      "theoretical_t_tail_lambda=",
+      "check_correlations_match=True",
+      "check_t_dominates_gaussian_joint_tail=True",
+      "check_divergence_grows_with_depth=True",
+      "check_gaussian_lambda_decays=True",
+      "check_t_lambda_stabilizes=True",
+      "verdict=TAIL_DEPENDENCE_VERIFIED"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "scipy"
+    ]
+  }
+}
