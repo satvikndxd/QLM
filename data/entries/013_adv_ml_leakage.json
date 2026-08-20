@@ -1,0 +1,98 @@
+{
+  "schema_version": 2,
+  "entry_kind": "adversarial",
+  "expected_verdict": "REJECTED_FEATURE_LEAKAGE",
+  "flaws": [
+    {
+      "type": "train_test_leakage",
+      "severity": "fatal",
+      "location": "code_implementation:full_sample_zscore",
+      "description": "The naive pipeline fits the feature scaler (per-asset mean/variance of the price-based value score) on the ENTIRE 1000-day panel BEFORE the train/test split. Each historical feature value therefore contains the asset's full-sample average price — which includes the test period — so 'price below its full-sample mean' mechanically predicts that future prices sit above today's, manufacturing Sharpe ~1.3 in an economy with zero true alpha by construction.",
+      "detection": "Recompute the identical feature with expanding-window (walk-forward) statistics using only data available at time t and rerun the unchanged model and backtest: the Sharpe collapsing from ~1.3 to ~0 convicts the scaler's information set. Static tell: any fit/fit_transform call (or mean/std over the full time axis) executed before the temporal split, on any feature derived from prices or returns.",
+      "corrective_action": "Move all feature scaling inside the walk-forward loop or use expanding/rolling statistics computed strictly from data at or before t (vectorizable via cumulative sums); refit scalers only on training data at each rebalance. Report the audited ~0 Sharpe as the only honest estimate."
+    }
+  ],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "main",
+        "reason": "Monte Carlo replication loop over 20 independent seeded panels; a single 500-day test Sharpe has ~0.7 sampling std, so the audit must average replications rather than hinge on one draw",
+        "max_iterations": 20
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "multi_turn_audit",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000013-adv-ml-leakage",
+    "domain": "Machine Learning / Cross-Sectional Factors",
+    "complexity": 6,
+    "tags": [
+      "adversarial",
+      "feature-leakage",
+      "train-test-leakage",
+      "standard-scaler",
+      "walk-forward",
+      "expanding-window",
+      "zero-alpha-null",
+      "cross-sectional",
+      "monte-carlo"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "An ML factor pipeline reports Sharpe ~1.3 from a value-style feature. The auditor's first question for any ML backtest: what is the information set of EVERY preprocessing statistic, not just of the model fit? Train/test splits guard the estimator but practitioners routinely fit scalers, imputers, and normalizers on the full panel first — and any statistic computed over the full time axis of a price-derived feature smuggles the future into the past. The decisive audit design: build the economy with ZERO true alpha, so any positive out-of-sample Sharpe is a certificate of contamination rather than a debatable quality judgment; then hold model and backtest fixed and swap only the scaler's information set.",
+    "tool_selection": "Python REPL with numpy only: the model is a closed-form pooled cross-sectional OLS slope, the expanding mean/variance are cumulative-sum identities, and avoiding a heavier ML stack proves the flaw lives in the preprocessing information set, not in estimator complexity.",
+    "recursive_delegation": "Single-agent scale. In a production model-review queue, delegate one sub-agent per submitted pipeline to run the standardized information-set ablation (full-sample vs walk-forward preprocessing, model frozen), with the parent owning the zero-alpha synthetic harness so every pipeline is convicted or cleared against the same null economy."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "Naive claim: the value composite earns Sharpe ~1.3 out of sample. Audit hypotheses — H0: the result is invariant to the scaler's information set, i.e. Sharpe(full-sample scaling) - |Sharpe(expanding scaling)| <= 0.8 with the model and backtest frozen. H1: the gap exceeds 0.8 AND naive mean Sharpe > 1.0 AND |audited mean Sharpe| < 0.4, convicting feature leakage. Ground truth favors H1 by construction: returns are beta_i*f_t + eps_it with zero alpha, so the audited pipeline has nothing to find and any naive edge is manufactured by the leaked full-sample mean/variance. Sharpes are averaged over 20 independent panels because a single 500-day test Sharpe has ~0.7 sampling std.",
+    "data_engineering": "Per replication: 500 assets x 1000 days, seeded; betas U(0.5,1.5), market factor 16% annualized, idiosyncratic noise 30% — zero alpha everywhere. Log prices are cumulative return sums; the raw feature is the log price buried in independent scoring noise (FEATURE_NOISE_VOL=1.2), making the composite ~99% noise — the leak survives dilution because the leaked component is systematic, which is exactly what makes this trap realistic rather than cartoonish (undiluted, the naive Sharpe is an implausible ~11; diluted, it is a seductive ~1.3). Both pipelines receive the IDENTICAL raw feature; only the standardization statistics differ: full-sample mean/std versus expanding mean/std via cumulative sums with a 60-day burn-in.",
+    "methodology_justification": "The audit is a controlled information-set ablation, not a statistical horse race: one closed-form OLS slope, one dollar-neutral unit-gross daily long-short backtest, two scaler variants. The zero-alpha null economy is the key design choice — with real signals present, a leakage audit degenerates into arguing over attribution; with a null economy, any naive out-of-sample edge is contamination by definition. The 20-replication Monte Carlo makes the conviction thresholds (naive > 1.0, |audited| < 0.4, gap > 0.8) statistically meaningful: the audited mean has standard error ~0.16, so the band is a ~2.5-sigma acceptance region around the true zero. Expanding statistics are computed by cumulative-sum identities, demonstrating that walk-forward correctness costs no loops and no runtime.",
+    "code_implementation": "\"\"\"ADVERSARIAL TEACHING ENTRY: cross-sectional feature leakage via a\nscaler fit on the full panel BEFORE the train/test split.\n\nPedagogical arc: plausible ML pipeline -> attractive naive Sharpe ->\nadversarial audit -> flaw exposed -> honest null result.\n\nThe economy has ZERO true alpha by construction: returns are market\nbeta times a common factor plus idiosyncratic noise. The feature is a\n'value' signal — the asset's log price standardized per asset. The\nNAIVE pipeline fits the scaler (mean/variance) on the ENTIRE 1000-day\npanel and only then splits train/test: each historical feature value now\ncontains the asset's FULL-SAMPLE average price, which includes the test\nperiod. 'Price below its full-sample mean' mechanically predicts that\nfuture prices lie above today's — a phantom mean-reversion edge scored\nas alpha. The AUDITED pipeline computes the identical feature with\nexpanding-window (walk-forward) statistics using only data available at\ntime t, and the edge evaporates to ~0. The model is a closed-form\ncross-sectional OLS slope (numpy-only linear algebra) so the ONLY\ndifference between pipelines is the scaler's information set.\nDeterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nRNG_SEED = 13\nN_REPS = 20                 # independent panel replications: a single 500-day\n                            # test Sharpe has ~0.7 sampling std; the audit\n                            # must not hinge on one lucky draw\nN_ASSETS = 500\nN_DAYS = 1000\nANN = 252\nWARMUP = 60                 # expanding stats need a burn-in window\nTRAIN_END = 500             # model fit on days [WARMUP, TRAIN_END)\nBETA_LO, BETA_HI = 0.5, 1.5\nMKT_VOL = 0.16 / np.sqrt(ANN)\nIDIO_VOL = 0.30 / np.sqrt(ANN)\nFEATURE_NOISE_VOL = 1.2     # analyst/composite noise added to the raw score\nNAIVE_SHARPE_FLOOR = 1.0    # conviction thresholds for the audit\nAUDITED_SHARPE_BAND = 0.4\nGAP_THRESHOLD = 0.8\n\n\ndef simulate_panel(seed: int) -> np.ndarray:\n    \"\"\"Zero-alpha economy: r_it = beta_i * f_t + eps_it. Nothing here is\n    predictable from any feature built on past prices.\"\"\"\n    rng = np.random.default_rng(seed)\n    betas = rng.uniform(BETA_LO, BETA_HI, N_ASSETS)\n    f = MKT_VOL * rng.standard_normal(N_DAYS)\n    eps = IDIO_VOL * rng.standard_normal((N_DAYS, N_ASSETS))\n    return betas[None, :] * f[:, None] + eps\n\n\ndef full_sample_zscore(logp: np.ndarray) -> np.ndarray:\n    \"\"\"THE FLAW: StandardScaler-style per-asset standardization fit on the\n    ENTIRE panel. mean/std over axis=0 include days the model will later\n    be tested on — future information enters every historical feature.\"\"\"\n    mu = logp.mean(axis=0, keepdims=True)\n    sd = logp.std(axis=0, ddof=1, keepdims=True)\n    return (logp - mu) / sd\n\n\ndef expanding_zscore(logp: np.ndarray) -> np.ndarray:\n    \"\"\"THE FIX: walk-forward standardization. The z-score at day t uses\n    mean/std of days <= t only — computed vectorized via cumulative sums,\n    no time loop needed.\"\"\"\n    t = np.arange(1, N_DAYS + 1)[:, None].astype(float)\n    csum = np.cumsum(logp, axis=0)\n    csum2 = np.cumsum(logp ** 2, axis=0)\n    mu = csum / t\n    var = np.maximum((csum2 - t * mu ** 2) / np.maximum(t - 1.0, 1.0), 1e-12)\n    return (logp - mu) / np.sqrt(var)\n\n\ndef cross_sectional_demean(x: np.ndarray) -> np.ndarray:\n    return x - x.mean(axis=1, keepdims=True)\n\n\ndef fit_and_backtest(z: np.ndarray, rets: np.ndarray) -> float:\n    \"\"\"Identical model/backtest for both pipelines: pooled cross-sectional\n    OLS slope fit on the train window only, dollar-neutral daily\n    long-short portfolio scored on the test window only.\"\"\"\n    x = cross_sectional_demean(z[:-1])          # feature at t ...\n    y = cross_sectional_demean(rets[1:])        # ... predicts return at t+1\n    xtr = x[WARMUP:TRAIN_END - 1]\n    ytr = y[WARMUP:TRAIN_END - 1]\n    slope = float((xtr * ytr).sum() / (xtr ** 2).sum())   # closed-form OLS\n    xte = x[TRAIN_END - 1:]\n    yte = y[TRAIN_END - 1:]\n    pred = slope * xte\n    w = cross_sectional_demean(pred)\n    w = w / np.abs(w).sum(axis=1, keepdims=True)          # dollar-neutral, unit gross\n    port = (w * yte).sum(axis=1)\n    sd = port.std(ddof=1)\n    return 0.0 if sd == 0 else float(port.mean() / sd * np.sqrt(ANN))\n\n\ndef run_once(seed: int) -> tuple:\n    rets = simulate_panel(seed)\n    logp = np.cumsum(rets, axis=0)              # log price paths\n    # Realistic 'value composite': the price signal buried in independent\n    # scoring noise. The SAME raw feature feeds both pipelines — only the\n    # scaler's information set differs. Even heavily diluted, the leaked\n    # full-sample mean is systematic and survives out of sample.\n    rng = np.random.default_rng(seed + 10_000)\n    raw = logp + FEATURE_NOISE_VOL * rng.standard_normal(logp.shape)\n    return (fit_and_backtest(full_sample_zscore(raw), rets),\n            fit_and_backtest(expanding_zscore(raw), rets))\n\n\ndef main() -> None:\n    pairs = [run_once(RNG_SEED + k) for k in range(N_REPS)]  # MC replications\n    naive = np.array([p[0] for p in pairs])\n    audited = np.array([p[1] for p in pairs])\n    naive_sharpe = float(naive.mean())\n    audited_sharpe = float(audited.mean())\n    gap = naive_sharpe - abs(audited_sharpe)\n    flawed = (naive_sharpe > NAIVE_SHARPE_FLOOR\n              and abs(audited_sharpe) < AUDITED_SHARPE_BAND\n              and gap > GAP_THRESHOLD)\n    audit_verdict = \"REJECTED_FEATURE_LEAKAGE\" if flawed else \"NO_LEAKAGE_DETECTED\"\n\n    print(\"RESULTS\")\n    print(f\"n_assets={N_ASSETS}\")\n    print(f\"n_days={N_DAYS}\")\n    print(f\"n_replications={N_REPS}\")\n    print(f\"true_alpha=0.0\")\n    print(f\"naive_sharpe={naive_sharpe:.3f}\")\n    print(f\"naive_sharpe_std={float(naive.std(ddof=1)):.3f}\")\n    print(f\"audited_sharpe={audited_sharpe:.3f}\")\n    print(f\"audited_sharpe_std={float(audited.std(ddof=1)):.3f}\")\n    print(f\"naive_positive_rate={float((naive > 0).mean()):.2f}\")\n    print(f\"sharpe_gap={gap:.3f}\")\n    print(f\"naive_sharpe_floor={NAIVE_SHARPE_FLOOR}\")\n    print(f\"audited_sharpe_band={AUDITED_SHARPE_BAND}\")\n    print(\"flaw_type=FEATURE_LEAKAGE\")\n    print(f\"audit_verdict={audit_verdict}\")\n    print(f\"verdict={audit_verdict}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at base seed 13: naive_sharpe 1.292 (cross-replication std 0.66), audited_sharpe -0.028 (std 0.75), gap 1.26, naive positive in 90% of replications. Cross-base-seed behavior (1, 13, 42, 777): naive mean in [1.18, 1.46], audited mean in [-0.08, 0.27], verdict REJECTED_FEATURE_LEAKAGE in every case. Dose-response calibration on the dilution parameter: naive mean Sharpe 3.29 / 1.59 / 1.00 / 0.71 at noise 0.5 / 1.0 / 1.5 / 2.0 while the audited mean stays within 0.10 of zero throughout — the leak channel scales exactly as the feature's correlation with the leaked component predicts, and the audit is flat, confirming it measures information sets rather than signal strength.",
+    "risk_and_backtest_audit": "Deploying the naive number funds a strategy whose true expectation is zero minus costs: with 20% daily top-versus-bottom turnover implied by a price-level signal and realistic 5-10bp costs, realized performance is systematically negative, and the desk discovers the leak only through live-vs-backtest divergence — the most expensive possible detection channel. Frictions are deliberately excluded so the measured gap isolates the leakage channel alone; costs would only widen it. The backtest itself is honest (signal at t predicts t+1, no same-day peeking, train/test model discipline correct), which is the pedagogical point: leakage upstream of a clean backtest defeats it. Institutional protocol: every feature pipeline must declare the information set of each preprocessing statistic, and CI should re-run any submitted backtest with preprocessing forced walk-forward, flagging material divergence automatically."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The trap survives code review because the model discipline LOOKS perfect — split before fit, lagged features, out-of-sample scoring — while the scaler was fit one line earlier on the full panel; the flaw is upstream of everything reviewers habitually check. (2) Per-DAY cross-sectional z-scoring (rank or z across assets at fixed t) is temporally safe — the dangerous axis is TIME; conflating the two makes auditors either paranoid or blind. (3) Diluted leaks are the realistic ones: an undiluted price z-score gives Sharpe ~11 and would be caught on sight, while this composite's 1.3 sails through review. (4) A single-panel audit can acquit by luck: with sampling std ~0.7, one audited Sharpe of 0.5 is unremarkable noise — replication is part of the audit's correctness, not decoration.",
+    "falsification_strategy": "Attempt to rescue the naive result: (a) set FEATURE_NOISE_VOL to 0 — the naive Sharpe must EXPLODE (~11) while the audited stays ~0, confirming the leak channel and its dilution scaling; (b) replace the full-sample scaler with the expanding scaler inside the naive pipeline — the two pipelines must converge, proving no other difference exists; (c) shuffle asset identities of the feature panel within each day — both pipelines must go to ~0, confirming the edge needs the per-asset leaked mean, not cross-sectional structure; (d) inject true alpha into returns — the audited pipeline must now find it, proving the audit does not destroy genuine signal along with leakage.",
+    "limitations": "The simulation isolates one leakage vector (per-asset scaler statistics over the full time axis); real pipelines leak through imputation, winsorization bounds, PCA loadings, target encoders, and hyperparameter selection on test folds — each needs the same information-set ablation. Returns are iid Gaussian: with volatility clustering, expanding variance estimates lag regimes, so even the audited pipeline needs care near vol breaks. The linear model understates how aggressively flexible learners (forests, boosting) exploit leaked statistics — gaps measured here are lower bounds. Conviction thresholds are calibrated to this panel geometry (500 x 1000, 50/50 split) and must be recalibrated for other shapes."
+  },
+  "agent_instructions": "1. Reproduce the naive pipeline exactly as submitted: per-asset full-sample standardization of the value composite, pooled OLS slope on the train window, dollar-neutral long-short scored on the test window. 2. Interrogate every preprocessing statistic's information set: list each mean, variance, or bound and the data range it was computed on; any full-time-axis statistic on a price-derived feature is a presumptive leak. 3. Rebuild the identical feature with expanding-window statistics (cumulative-sum identities, 60-day burn-in) and rerun the frozen model and backtest. 4. Replicate both pipelines across 20 independent seeded panels; compare mean Sharpes against the thresholds: naive > 1.0, |audited| < 0.4, gap > 0.8. 5. If convicted, print flaw_type=FEATURE_LEAKAGE and verdict=REJECTED_FEATURE_LEAKAGE, reporting the audited ~0 as the only honest estimate. 6. Run the dilution control (noise 0) and the convergence control (expanding scaler in both pipelines) to certify the harness. 7. In the final report, mandate information-set declarations for every preprocessing statistic in future submissions.",
+  "verification": {
+    "timeout_seconds": 240,
+    "must_print": [
+      "RESULTS",
+      "n_assets=500",
+      "n_days=1000",
+      "true_alpha=0.0",
+      "naive_sharpe=",
+      "audited_sharpe=",
+      "sharpe_gap=",
+      "flaw_type=FEATURE_LEAKAGE",
+      "audit_verdict=REJECTED_FEATURE_LEAKAGE",
+      "verdict=REJECTED_FEATURE_LEAKAGE"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy"
+    ]
+  }
+}

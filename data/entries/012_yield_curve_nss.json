@@ -1,0 +1,106 @@
+{
+  "schema_version": 2,
+  "entry_kind": "correct",
+  "expected_verdict": "NSS_CALIBRATION_VERIFIED",
+  "flaws": [],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "jacobian",
+        "reason": "central finite difference perturbs one parameter per iteration; bounded by the 6 NSS parameters",
+        "max_iterations": 6
+      },
+      {
+        "function": "profiled_starts",
+        "reason": "deterministic 4x4 multi-start grid over (tau1, tau2); betas are profiled out by a vectorized lstsq inside each cell",
+        "max_iterations": 16
+      },
+      {
+        "function": "calibrate",
+        "reason": "polish the top-3 profiled starts with L-BFGS-B and keep the best final SSE; basins must be polished sequentially",
+        "max_iterations": 3
+      },
+      {
+        "function": "degenerate_refit",
+        "reason": "profile grid over tau1 for the constrained tau-drift model (tau2 = 1.1 tau1); each cell is a vectorized lstsq",
+        "max_iterations": 75
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "tool_use",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000012-yield-curve-nss",
+    "domain": "Fixed Income / Yield Curves",
+    "complexity": 7,
+    "tags": [
+      "nelson-siegel-svensson",
+      "yield-curve",
+      "calibration",
+      "l-bfgs-b",
+      "separable-least-squares",
+      "identifiability",
+      "condition-number",
+      "tau-drift",
+      "bid-ask-noise"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "The request 'calibrate NSS to a noisy curve' hides two distinct problems that must be solved separately: (1) global optimization — the 6-parameter SSE surface has multiple basins and a naive single-start fit lands in the wrong one (verified during development: a single L-BFGS-B start converged to tau2 at its bound with RMSE only 0.3bp worse than truth); (2) identifiability — a calibration can succeed by RMSE while its parameters are meaningless, because when tau1 and tau2 drift together the two curvature loadings become collinear and beta2/beta3 are determined only up to an exploding difference. The testable claim is therefore joint: the fit must recover the true curve AND its Jacobian must certify the parameters are identified, with a constructed tau-drift counterexample proving the RMSE alone cannot make that certification.",
+    "tool_selection": "Python REPL with numpy for the NSS basis algebra and lstsq beta-profiling, scipy.optimize.minimize (L-BFGS-B, bounded) for the nonlinear polish. The condition number needs only numpy.linalg.cond on a finite-difference Jacobian — no autodiff dependency.",
+    "recursive_delegation": "Not needed for one curve. For a multi-currency curve set, delegate one calibration per currency to sub-agents but centralize the identifiability policy (condition-number threshold, tau bounds) in the parent, because per-agent thresholds drift and cross-currency parameter comparisons are meaningless unless every curve passed the same identification gate."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "H0 (all must hold for NSS_CALIBRATION_VERIFIED): (a) in-sample RMSE < 2bp, consistent with the 1bp half-spread noise (uniform on [-1,1]bp has std 0.58bp); (b) the fitted curve tracks the TRUE curve within 3bp at every maturity on a dense grid (functional recovery, the economically meaningful target — individual betas trade off against taus and are not the right recovery metric); (c) fitted taus within 35% relative error; (d) cond(J) < 1e6 at the optimum, certifying local identifiability; (e) the deliberately degenerate refit (tau2 collapsed to 1.1*tau1) exhibits cond(J) more than 10x the honest fit's WHILE its RMSE stays under 5bp — proving RMSE alone cannot detect tau drift. Any failure yields NSS_CALIBRATION_FAILED.",
+    "data_engineering": "15 seeded synthetic quotes at maturities 1m-30y from a true NSS curve (beta = 4.5%, -2.0%, -4.0%, +3.0%; tau1 = 0.8y, tau2 = 8y — deliberately well-separated humps so ground truth is identified), plus uniform bid-ask noise with 1bp half-spread simulating mid quotes scattered inside the spread. The two-hump design is load-bearing: with flat curvature or overlapping taus, no optimizer can recover parameters that the data do not pin down. On real data this step maps to filtering off-the-run/stale quotes and choosing par vs zero curve bootstrapping before any fitting.",
+    "methodology_justification": "NSS is separable: for fixed (tau1, tau2) the betas enter linearly, so the fit profiles them out with lstsq over a deterministic 4x4 tau grid and polishes only the top-3 starts with bounded L-BFGS-B, keeping the best final SSE. This variable-projection strategy dominates naive 6-parameter descent because the hard nonconvexity lives entirely in the 2D tau space, where a coarse grid reliably brackets the global basin. Identifiability is audited with the condition number of the finite-difference Jacobian d(yield)/d(params) at the optimum — the local sensitivity object that goes singular exactly when the beta2/beta3 curvature columns collinearize. The degenerate comparison uses the BEST fit achievable under collapsed taus (profiled over a fine tau1 grid), not a strawman, so the RMSE-looks-fine/parameters-are-garbage contrast is honest.",
+    "code_implementation": "\"\"\"Nelson-Siegel-Svensson calibration to a noisy synthetic yield curve,\nwith a parameter-identifiability audit via the Jacobian condition number.\n\nLessons encoded: (1) NSS calibration is a separable problem — for fixed\n(tau1, tau2) the betas are LINEAR, so profiling them out with lstsq over\na deterministic tau grid before the L-BFGS-B polish removes the local-\nminimum roulette that plagues naive 6-parameter fits. (2) A good RMSE is\nNOT evidence of a good model: when tau1 and tau2 drift together, the\ncurvature basis functions become collinear, beta2/beta3 explode in\nopposite directions, and the fit remains visually perfect — only the\nJacobian condition number exposes the degeneracy ('tau drift'). The\nentry fits the honest curve, then deliberately constructs the degenerate\nrefit to show the condition number blowing up by orders of magnitude.\nDeterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nfrom scipy.optimize import minimize\n\nRNG_SEED = 12\nMATURITIES = np.array([1 / 12, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0,\n                       10.0, 12.0, 15.0, 20.0, 25.0, 30.0])\nTRUE_PARAMS = np.array([0.045, -0.020, -0.040, 0.030, 0.8, 8.0])\nHALF_SPREAD_BPS = 1.0          # bid-ask half-spread; mid quotes sampled inside\nCOND_LIMIT = 1e6               # identifiability threshold on cond(J)\nRMSE_LIMIT_BPS = 2.0\nDEGEN_RMSE_FINE_BPS = 5.0      # a <=5bp RMSE curve still looks 'fine' on a chart\nTAU1_GRID = (0.5, 1.0, 2.0, 4.0)\nTAU2_GRID = (6.0, 10.0, 16.0, 25.0)\nBOUNDS = [(-0.05, 0.15), (-0.15, 0.15), (-0.30, 0.30), (-0.30, 0.30),\n          (0.05, 10.0), (2.0, 40.0)]\n\n\ndef nss_basis(tau: np.ndarray, t1: float, t2: float) -> np.ndarray:\n    \"\"\"NSS loadings: level, slope, curvature(t1), curvature(t2).\"\"\"\n    x1, x2 = tau / t1, tau / t2\n    f1 = (1.0 - np.exp(-x1)) / x1\n    f2 = f1 - np.exp(-x1)\n    f3 = (1.0 - np.exp(-x2)) / x2 - np.exp(-x2)\n    return np.column_stack([np.ones_like(tau), f1, f2, f3])\n\n\ndef nss_yield(params: np.ndarray, tau: np.ndarray) -> np.ndarray:\n    return nss_basis(tau, params[4], params[5]) @ params[:4]\n\n\ndef sse(params: np.ndarray, tau: np.ndarray, y: np.ndarray) -> float:\n    return float(((nss_yield(params, tau) - y) ** 2).sum())\n\n\ndef jacobian(params: np.ndarray, tau: np.ndarray) -> np.ndarray:\n    \"\"\"Central-difference Jacobian d(yield)/d(params), one column per param.\"\"\"\n    J = np.zeros((tau.size, params.size))\n    for k in range(params.size):      # 6 parameters: bounded, sequential by design\n        step = 1e-6 * max(1.0, abs(params[k]))\n        dp = np.zeros_like(params)\n        dp[k] = step\n        J[:, k] = (nss_yield(params + dp, tau) - nss_yield(params - dp, tau)) / (2 * step)\n    return J\n\n\ndef profiled_starts(tau: np.ndarray, y: np.ndarray, k: int = 3) -> list:\n    \"\"\"Grid over (tau1, tau2) with betas profiled out by lstsq (separability).\n\n    Returns the k best starts by SSE: polishing several basins and keeping\n    the best final SSE removes the local-minimum roulette.\"\"\"\n    cands = []\n    for t1 in TAU1_GRID:              # deterministic 4x4 multi-start grid\n        for t2 in TAU2_GRID:\n            if t2 <= 2.0 * t1:\n                continue              # enforce tau separation in the starts\n            X = nss_basis(tau, t1, t2)\n            b, *_ = np.linalg.lstsq(X, y, rcond=None)\n            r = float(((X @ b - y) ** 2).sum())\n            cands.append((r, np.concatenate([b, [t1, t2]])))\n    cands.sort(key=lambda c: c[0])\n    return [c[1] for c in cands[:k]]\n\n\ndef calibrate(tau: np.ndarray, y: np.ndarray) -> np.ndarray:\n    best, best_sse = None, np.inf\n    for x0 in profiled_starts(tau, y):   # polish top-3 basins, keep best\n        res = minimize(sse, x0, args=(tau, y), method=\"L-BFGS-B\",\n                       bounds=BOUNDS, options={\"ftol\": 1e-18, \"gtol\": 1e-14,\n                                               \"maxiter\": 2000})\n        if res.fun < best_sse:\n            best_sse, best = res.fun, res.x\n    return best\n\n\ndef degenerate_refit(tau: np.ndarray, y: np.ndarray) -> np.ndarray:\n    \"\"\"Tau-drift scenario: the BEST fit achievable with tau2 collapsed onto\n    tau1 (tau2 = 1.1 tau1), betas profiled by lstsq over a fine tau1 grid.\n\n    The two curvature columns become near-collinear; beta2 and beta3\n    explode in opposite directions while the curve still tracks the\n    quotes — the pathology is visible ONLY in the Jacobian condition\n    number, not in the RMSE.\"\"\"\n    best, best_sse = None, np.inf\n    for t1 in np.linspace(0.3, 15.0, 75):   # constrained-model profile grid\n        t2 = 1.1 * t1\n        X = nss_basis(tau, t1, t2)\n        b, *_ = np.linalg.lstsq(X, y, rcond=None)\n        r = float(((X @ b - y) ** 2).sum())\n        if r < best_sse:\n            best_sse, best = r, np.concatenate([b, [t1, t2]])\n    return best\n\n\ndef main() -> None:\n    rng = np.random.default_rng(RNG_SEED)\n    y_true = nss_yield(TRUE_PARAMS, MATURITIES)\n    noise = rng.uniform(-1.0, 1.0, MATURITIES.size) * HALF_SPREAD_BPS / 1e4\n    y_mkt = y_true + noise            # mid quotes scattered inside the spread\n\n    fit = calibrate(MATURITIES, y_mkt)\n    resid = nss_yield(fit, MATURITIES) - y_mkt\n    rmse_bps = float(np.sqrt((resid ** 2).mean()) * 1e4)\n    cond = float(np.linalg.cond(jacobian(fit, MATURITIES)))\n\n    degen = degenerate_refit(MATURITIES, y_mkt)\n    resid_d = nss_yield(degen, MATURITIES) - y_mkt\n    rmse_d_bps = float(np.sqrt((resid_d ** 2).mean()) * 1e4)\n    cond_degen = float(np.linalg.cond(jacobian(degen, MATURITIES)))\n\n    dense = np.linspace(MATURITIES[0], MATURITIES[-1], 400)\n    curve_err_bps = float(np.abs(nss_yield(fit, dense)\n                                 - nss_yield(TRUE_PARAMS, dense)).max() * 1e4)\n    tau_rel_err = float(np.abs(fit[4:] / TRUE_PARAMS[4:] - 1.0).max())\n\n    print(\"RESULTS\")\n    print(f\"n_quotes={MATURITIES.size}\")\n    print(f\"half_spread_bps={HALF_SPREAD_BPS}\")\n    print(f\"fitted_params={np.array2string(fit, precision=4, separator=',')}\")\n    print(f\"rmse_bps={rmse_bps:.3f}\")\n    print(f\"condition_number={cond:.1f}\")\n    print(f\"max_curve_error_bps={curve_err_bps:.2f}\")\n    print(f\"max_tau_relative_error={tau_rel_err:.4f}\")\n    print(f\"degenerate_rmse_bps={rmse_d_bps:.3f}\")\n    print(f\"degenerate_condition_number={cond_degen:.1f}\")\n    print(f\"identifiability_ratio={cond_degen / cond:.1f}\")\n\n    checks = {\n        \"rmse_within_noise_budget\": rmse_bps < RMSE_LIMIT_BPS,\n        \"curve_recovered\": curve_err_bps < 3.0,\n        \"taus_recovered\": tau_rel_err < 0.35,\n        \"jacobian_well_conditioned\": cond < COND_LIMIT,\n        \"tau_drift_detected_by_condition_number\": cond_degen > 10.0 * cond,\n        \"degenerate_fit_looks_fine_by_rmse\": rmse_d_bps < DEGEN_RMSE_FINE_BPS,\n    }\n    for name, passed in checks.items():\n        print(f\"check_{name}={passed}\")\n    ok = all(checks.values())\n    print(f\"verdict={'NSS_CALIBRATION_VERIFIED' if ok else 'NSS_CALIBRATION_FAILED'}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at seed 12: fitted params [0.0456, -0.0206, -0.0407, 0.0285, 0.813, 7.716] vs truth [0.045, -0.02, -0.04, 0.03, 0.8, 8.0]; rmse_bps 0.528; max dense-grid curve error 0.67bp; cond(J) ~1.34e4 vs degenerate cond ~2.66e5 (identifiability ratio ~20) while the degenerate RMSE stays at 3.9bp — visually a fine fit. Cross-seed robustness: all six checks pass at seeds {1, 7, 12, 42, 99, 2026}; the condition-number contrast (>10x) holds in every seed, so the detector is structural, not a seed artifact.",
+    "risk_and_backtest_audit": "What is modeled: bid-ask noise on mids, parameter bounds, multi-start global search, identifiability certification. What is NOT: heteroskedastic noise across the curve (long-end quotes are wider in practice, motivating spread-weighted least squares), day-to-day parameter stability (production systems warm-start from yesterday's fit and monitor tau paths — tau drift usually appears as a time series pathology before a single-day one), and duration-weighted price errors (central banks fit price space with inverse-duration weights; yield-space fitting overweights the short end). A desk deploying these parameters into pricing or risk feeds must gate every daily refit on the condition number, because hedge ratios computed from an unidentified fit allocate risk arbitrarily between the two curvature factors even while the curve itself is correct."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The central trap: a near-perfect RMSE with meaningless parameters — under tau drift the curve is fine but beta2/beta3 are determined only up to an exploding difference, so any downstream use of individual factors (carry attribution, hedging, cross-country comparison) is corrupted silently. (2) Single-start L-BFGS-B converges to a wrong basin on this exact instance (observed during development with 2bp noise: tau2 pinned at 25y, RMSE still 1.3bp) — multi-start with profiled betas is not optional. (3) cond(J) mixes units (levels vs taus); the 1e6 threshold is calibrated for this parameterization and rate scale, not universal. (4) Six parameters against 15 quotes leaves ~9 residual degrees of freedom; adding maturities near the humps is worth more than tightening the optimizer.",
+    "falsification_strategy": "(a) Refit with the noise regenerated at 5x the half-spread: the curve-recovery check must degrade before the conditioning check does, confirming they measure different failure modes. (b) Flatten the true curve (beta2 = beta3 = 0): taus become unidentified and the conditioning check must FAIL, proving the detector rejects curves whose data cannot identify the model rather than always passing. (c) Force the true taus together (tau2 = 1.2*tau1): the honest fit itself must now exhibit cond(J) near the degenerate level. (d) Rerun across seeds {1, 7, 42, 99, 2026} — all checks held, so no conclusion rests on one noise draw.",
+    "limitations": "This is a single-date cross-sectional fit: it says nothing about intertemporal parameter stability, which is where tau drift actually manifests on real desks (as oscillating tau paths across days). The Jacobian condition number is a LOCAL identifiability certificate — it cannot see distinct distant basins with near-equal SSE; only the multi-start grid addresses that, coarsely. Uniform noise and equal weighting ignore the maturity-dependent quote quality of real curves. NSS itself is a parametric choice: for pricing consistency a spline with smoothing penalties may dominate, and NSS's advantage (interpretable factors) is exactly what tau drift destroys."
+  },
+  "agent_instructions": "1. Simulate the 15 seeded quotes from the true NSS curve with 1bp half-spread uniform noise. 2. Build the profiled multi-start: for each (tau1, tau2) on the 4x4 grid with tau2 > 2*tau1, solve the betas by lstsq and record SSE. 3. Polish the top-3 starts with bounded L-BFGS-B on the full 6-parameter SSE; keep the best final SSE. 4. Compute rmse_bps and the finite-difference Jacobian at the optimum; report cond(J) and require it below 1e6. 5. Verify functional recovery: fitted-vs-true curve error under 3bp on a dense maturity grid, and taus within 35%. 6. Construct the tau-drift counterexample: best constrained fit with tau2 = 1.1*tau1 (profiled over a fine tau1 grid); require its cond(J) to exceed 10x the honest fit's while its RMSE stays under 5bp. 7. Emit verdict=NSS_CALIBRATION_VERIFIED only if every check passes; otherwise name the failing check. 8. Report that parameter-level uses (hedging, attribution) require the conditioning gate on every refit, not just at calibration time.",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": [
+      "RESULTS",
+      "rmse_bps=",
+      "condition_number=",
+      "degenerate_condition_number=",
+      "identifiability_ratio=",
+      "check_rmse_within_noise_budget=True",
+      "check_curve_recovered=True",
+      "check_jacobian_well_conditioned=True",
+      "check_tau_drift_detected_by_condition_number=True",
+      "check_degenerate_fit_looks_fine_by_rmse=True",
+      "verdict=NSS_CALIBRATION_VERIFIED"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "scipy"
+    ]
+  }
+}
