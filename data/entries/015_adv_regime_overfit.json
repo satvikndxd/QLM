@@ -1,0 +1,105 @@
+{
+  "schema_version": 2,
+  "entry_kind": "adversarial",
+  "expected_verdict": "REJECTED_REGIME_OVERFITTING",
+  "flaws": [
+    {
+      "type": "regime_overfitting",
+      "severity": "fatal",
+      "location": "code_implementation:main (naive 70/30 chronological split + grid optimization)",
+      "description": "The researcher grid-optimizes a Bollinger-style contrarian strategy's (lookback, entry-z) on a training window that sits entirely inside the calm mean-reverting regime of a 2-state HMM, treats a chronological 70/30 split as a robustness test, and never runs a structural-break test. The hidden regime switches to a trending high-volatility state inside the OOS window: in-sample Sharpe ~3.1 collapses to ~-1.6 out of sample.",
+      "detection": "Run the CUSUM-of-squares test on the full return series BEFORE trusting any chronological split: the statistic (~16.7 vs 1.36 critical) rejects variance constancy and its argmax locates the break within one day of the true switch. Generic tell: a training window whose realized volatility, autocorrelation, and drawdown profile are all materially different from the test window's has not tested the strategy — it has tested the regime.",
+      "corrective_action": "Test for structural breaks first (CUSUM/CUSUM-of-squares, Chow at candidate dates); if a break is found, evaluate the strategy per regime and size it by regime-conditional performance with an explicit regime-detection rule, or require the training window to span multiple regimes. Report the stress-regime Sharpe (~-1.6) alongside the calm-regime one — the deployable number is the mixture, not the calm-window fit."
+    }
+  ],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": [
+      {
+        "function": "simulate_hmm",
+        "reason": "hidden Markov state transition, OU pull, and AR(1) trend all depend on t-1 state; the recursion is mathematically necessary",
+        "max_iterations": 1764
+      },
+      {
+        "function": "main",
+        "reason": "4x4 hyperparameter grid search over (lookback, entry_z); each cell's backtest is fully vectorized internally",
+        "max_iterations": 16
+      }
+    ]
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "multi_turn_audit",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000015-adv-regime-overfit",
+    "domain": "Time-Series / Regime Shifts",
+    "complexity": 6,
+    "tags": [
+      "adversarial",
+      "regime-overfitting",
+      "hidden-markov-model",
+      "structural-break",
+      "cusum",
+      "mean-reversion",
+      "bollinger-bands",
+      "ornstein-uhlenbeck",
+      "train-test-split"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "A mean-reversion strategy reports in-sample Sharpe ~3 from a chronological 70/30 split. The auditor's first question for any single-split time-series result: is the data-generating process even stationary across the split? A chronological split only measures generalization if train and test are draws from the same regime — otherwise it measures the regime difference, and the researcher has fit the calm regime's physics (OU pull) while the test window runs the stress regime's physics (persistent trend, 3.5x vol). The audit design: simulate the 2-state HMM so ground truth is known, reproduce the naive grid optimization exactly, then run the CUSUM-of-squares test the researcher skipped and show it flags the break — with its argmax within a day of the true switch — before a single OOS trade is examined.",
+    "tool_selection": "Python REPL with numpy: HMM/OU/AR simulation is a necessary sequential recursion; the Bollinger z-score uses vectorized sliding windows; CUSUM-of-squares is a two-line cumulative-sum identity against the Brownian-bridge critical value. No optimizer library — the naive grid search IS the flaw mechanism.",
+    "recursive_delegation": "Single-agent scale. Auditing a book of submitted strategies would delegate one sub-agent per strategy to run the standardized break-test-then-split protocol, with the parent owning the regime-labeling reference so 'trained only in calm' is flagged consistently across submissions."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "Naive claim: contrarian Bollinger strategy with grid-optimized (lookback, entry-z) earns Sharpe ~3 and a 70/30 chronological split validates it. Audit hypotheses — H0: returns have constant variance across the sample (no structural break), so the split is informative; H1: CUSUM-of-squares statistic sqrt(T/2)*max|S_k - k/T| exceeds the 5% Brownian-bridge critical value 1.36, convicting a break. Conviction of the STRATEGY additionally requires the realized scenario (train >90% calm, OOS >40% stress, switch after the split), in-sample Sharpe > 1, and OOS Sharpe < 0 — the full pattern of regime overfitting rather than mere underperformance.",
+    "data_engineering": "1764 seeded days (7y) from a 2-state HMM: calm state generates OU log-price increments (mean-reversion speed 0.12/day, half-life ~6 days, 10% annualized vol) where a contrarian strategy has REAL edge; stress state generates a persistent downtrend (drift -25bp/day, AR(1) 0.25, 35% vol) where the same strategy fades a trend and is run over. Transition probabilities (calm->stress 6e-4/day) give ~6.6y expected calm duration; the seed selects a path realizing the pedagogical scenario — switch at day 1266, 40 days after the day-1234 split, with 94% of the OOS window in stress — and the scenario_realized check makes that conditioning explicit and machine-verifiable rather than hidden.",
+    "methodology_justification": "The strategy's in-sample edge is genuine, not noise-mined: OU dynamics reward contrarian entries by construction, which is exactly what makes the trap seductive — the researcher's backtest discipline (lagged signals, no peeking) is clean, and the 4x4 grid merely tunes a real calm-regime edge. The flaw is epistemic: a single chronological split cannot certify robustness when one regime spans the entire training window. CUSUM-of-squares is the right detector because the regime shift is primarily a VARIANCE break (10% -> 35% vol), for which squared-return cumulative sums are the classical test with a distribution-free Brownian-bridge critical value; its argmax doubles as a break-date estimator, landing within one day of truth here.",
+    "code_implementation": "\"\"\"ADVERSARIAL TEACHING ENTRY: regime overfitting in a mean-reversion\nstrategy, exposed by a CUSUM-of-squares structural-break audit.\n\nPedagogical arc: plausible strategy -> attractive in-sample result ->\nadversarial audit -> structural break detected -> corrected conclusion.\n\nReturns follow a 2-state hidden Markov model. Regime 1 (calm): an\nOrnstein-Uhlenbeck log-price — genuinely mean-reverting, low vol — where\na Bollinger-style contrarian strategy has real edge. Regime 2 (stress):\na trending, high-volatility process where the same strategy fades a\npersistent trend and is run over. The naive researcher grid-optimizes\n(lookback, entry-z) on a 70/30 chronological split whose training window\nsits ENTIRELY inside Regime 1, never tests for structural breaks, and\nships an in-sample Sharpe > 2. The regime switches inside the OOS\nwindow; the strategy collapses. The audit runs the CUSUM-of-squares test\non the full sample, detects the variance break at the true switch date,\nand rejects the naive result: a chronological split is NOT a robustness\ntest when a single regime spans the whole training window.\nDeterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nRNG_SEED = 197\nN_DAYS = 1764                # 7 trading years\nTRAIN_FRAC = 0.70            # naive chronological split\nANN = 252\n# Regime 1: OU mean reversion in log price (calm).\nOU_THETA = 0.12\nOU_MU = 0.0\nVOL_CALM = 0.10 / np.sqrt(ANN)\n# Regime 2: trending, high volatility (stress).\nTREND = -0.0025\nAR_STRESS = 0.25\nVOL_STRESS = 0.35 / np.sqrt(ANN)\n# HMM transition probabilities (expected calm duration ~6.6y).\nP_CALM_TO_STRESS = 0.0006\nP_STRESS_TO_CALM = 0.003\n# Naive optimization grid (the overfitting surface).\nLOOKBACKS = (10, 20, 30, 40)\nENTRY_ZS = (0.5, 1.0, 1.5, 2.0)\nCUSUM_CRITICAL = 1.36        # 5% Kolmogorov critical value (Brownian bridge)\n\n\ndef simulate_hmm(seed: int) -> tuple:\n    \"\"\"Two-state HMM: OU log-price increments in calm, AR(1) trend in stress.\n\n    Both the Markov chain and the return recursions depend on t-1 state,\n    so this loop is mathematically necessary.\"\"\"\n    rng = np.random.default_rng(seed)\n    u = rng.random(N_DAYS)\n    eps = rng.standard_normal(N_DAYS)\n    states = np.zeros(N_DAYS, dtype=int)\n    rets = np.zeros(N_DAYS)\n    logp = 0.0\n    prev_r = 0.0\n    s = 0                                    # start calm\n    for t in range(N_DAYS):                  # HMM + OU/AR recursion (t-1 state)\n        if s == 0 and u[t] < P_CALM_TO_STRESS:\n            s = 1\n        elif s == 1 and u[t] < P_STRESS_TO_CALM:\n            s = 0\n        states[t] = s\n        if s == 0:\n            r = -OU_THETA * (logp - OU_MU) + VOL_CALM * eps[t]\n        else:\n            r = TREND + AR_STRESS * prev_r + VOL_STRESS * eps[t]\n        rets[t] = r\n        logp += r\n        prev_r = r\n    return rets, states\n\n\ndef zscore_signal(logp: np.ndarray, lookback: int) -> np.ndarray:\n    \"\"\"Bollinger z-score of log price vs its rolling mean/std, vectorized\n    via sliding windows; first `lookback` entries are zero (no signal).\"\"\"\n    win = np.lib.stride_tricks.sliding_window_view(logp, lookback)\n    mu = win.mean(axis=1)\n    sd = win.std(axis=1, ddof=1)\n    z = np.zeros(logp.size)\n    valid = sd > 1e-12\n    z[lookback - 1:][valid] = ((logp[lookback - 1:] - mu) / np.where(valid, sd, 1.0))[valid]\n    return z\n\n\ndef strategy_returns(rets: np.ndarray, lookback: int, entry_z: float) -> np.ndarray:\n    \"\"\"Contrarian: short when z > entry, long when z < -entry; position\n    formed at t is paid r_{t+1} (no same-day peeking).\"\"\"\n    logp = np.cumsum(rets)\n    z = zscore_signal(logp, lookback)\n    pos = np.where(z > entry_z, -1.0, np.where(z < -entry_z, 1.0, 0.0))\n    return pos[:-1] * rets[1:]\n\n\ndef annualized_sharpe(x: np.ndarray) -> float:\n    sd = x.std(ddof=1)\n    return 0.0 if sd == 0 else float(x.mean() / sd * np.sqrt(ANN))\n\n\ndef cusum_of_squares(rets: np.ndarray) -> tuple:\n    \"\"\"CUSUM-of-squares statistic sqrt(T/2)*max|S_k - k/T| with the\n    Brownian-bridge 5% critical value; returns (statistic, argmax day).\"\"\"\n    r2 = rets ** 2\n    s = np.cumsum(r2) / r2.sum()\n    k = np.arange(1, rets.size + 1) / rets.size\n    dev = np.abs(s - k)\n    stat = float(np.sqrt(rets.size / 2.0) * dev.max())\n    return stat, int(dev.argmax())\n\n\ndef main() -> None:\n    rets, states = simulate_hmm(RNG_SEED)\n    split = int(N_DAYS * TRAIN_FRAC)\n    switch_day = int(states.argmax()) if states.any() else -1\n\n    # --- The naive researcher: grid-optimize on train, ship the winner ---\n    best, best_sharpe = None, -np.inf\n    for lb in LOOKBACKS:                     # 4x4 hyperparameter grid search\n        for ez in ENTRY_ZS:\n            sr = annualized_sharpe(strategy_returns(rets[:split], lb, ez))\n            if sr > best_sharpe:\n                best_sharpe, best = sr, (lb, ez)\n    lb, ez = best\n    full = strategy_returns(rets, lb, ez)    # positions from full price path\n    in_sample_sharpe = annualized_sharpe(full[:split - 1])\n    oos_sharpe = annualized_sharpe(full[split - 1:])\n\n    # --- The audit: structural-break test BEFORE trusting the split ------\n    cusum_stat, break_day = cusum_of_squares(rets)\n    break_detected = cusum_stat > CUSUM_CRITICAL\n    train_calm_frac = float((states[:split] == 0).mean())\n    oos_stress_frac = float((states[split:] == 1).mean())\n\n    scenario = (train_calm_frac > 0.90 and oos_stress_frac > 0.40\n                and split <= switch_day)\n    flawed = (scenario and in_sample_sharpe > 1.0 and oos_sharpe < 0.0\n              and break_detected)\n    audit_verdict = \"REJECTED_REGIME_OVERFITTING\" if flawed else \"NO_REGIME_BREAK_DETECTED\"\n\n    print(\"RESULTS\")\n    print(f\"n_days={N_DAYS}\")\n    print(f\"train_days={split}\")\n    print(f\"best_lookback={lb}\")\n    print(f\"best_entry_z={ez}\")\n    print(f\"in_sample_sharpe={in_sample_sharpe:.3f}\")\n    print(f\"oos_sharpe={oos_sharpe:.3f}\")\n    print(f\"true_switch_day={switch_day}\")\n    print(f\"cusum_statistic={cusum_stat:.3f}\")\n    print(f\"cusum_critical_5pct={CUSUM_CRITICAL}\")\n    print(f\"cusum_break_day={break_day}\")\n    print(f\"train_calm_fraction={train_calm_frac:.3f}\")\n    print(f\"oos_stress_fraction={oos_stress_frac:.3f}\")\n    print(f\"check_scenario_realized={scenario}\")\n    print(f\"check_break_detected={break_detected}\")\n    print(f\"check_break_located_near_switch={abs(break_day - switch_day) < 90}\")\n    print(\"flaw_type=REGIME_OVERFITTING\")\n    print(f\"audit_verdict={audit_verdict}\")\n    print(f\"verdict={audit_verdict}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at seed 197: grid selects (lookback 30, entry_z 0.5); in_sample_sharpe 3.082, oos_sharpe -1.638; CUSUM statistic 16.661 vs 1.36 critical (rejection by an order of magnitude); estimated break day 1267 vs true switch 1266; train window 100% calm, OOS window 94% stress. The scenario checks are printed so the conditioning is auditable: the entry claims 'WHEN a break splits train/test, the naive protocol fails and CUSUM catches it', and every element of that claim is machine-checked. Dose-response verified during construction: with the switch inside the training window instead, the naive Sharpe drops and the verdict correctly refuses to convict.",
+    "risk_and_backtest_audit": "Deploying the calm-regime fit means being maximally contrarian at the exact moment trend-following starts paying: the strategy shorts every rally in a persistent downtrend at 3.5x the volatility it was sized for — the realized OOS Sharpe of -1.6 EXCLUDES transaction costs, funding, and the forced deleveraging a real book would suffer at those vol levels, so it is an optimistic bound on the damage. Frictions are deliberately omitted so the measured collapse isolates the regime channel. Institutional protocol: every chronological-split backtest must ship with a structural-break test on the full sample and regime-conditional performance decomposition; a strategy trained on one regime is a bet ON that regime and must be labeled and sized as such."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) The trap is seductive because everything the researcher did is locally correct — real in-regime edge, clean signal lags, honest grid — and the failure is entirely in what was NOT done (break testing); code review cannot catch an omission. (2) A 70/30 split LOOKS like out-of-sample discipline, which makes it more dangerous than no split: it manufactures false confidence. (3) CUSUM-of-squares detects variance breaks; a regime shift in autocorrelation at constant vol would need a different detector (e.g. Chow on AR coefficients) — matching detector to break type is part of the lesson. (4) The seed conditions on the scenario (switch inside OOS); the scenario_realized check makes this explicit — without it, the entry would silently depend on a lucky path, which is itself a form of the flaw being taught.",
+    "falsification_strategy": "Attempt to rescue the naive result: (a) rerun with the stress regime disabled (P_CALM_TO_STRESS=0): CUSUM must NOT reject (statistic below critical) and OOS Sharpe stays positive — confirming the audit does not convict stationary series; (b) move the split past the switch so training spans both regimes: the grid then selects more defensive parameters and the IS/OOS gap must shrink; (c) sweep stress vol from 15% to 35%: the CUSUM statistic must grow monotonically with the break size; (d) run the strategy long-momentum instead of contrarian in the OOS window — it profits there, confirming the OOS loss is regime physics, not a broken harness.",
+    "limitations": "The HMM has exactly two states with a single dominant switch; real markets blend regimes continuously and CUSUM's single-break framing needs extensions (ICSS algorithm) for multiple breaks. The scenario is seed-conditioned by design — the entry teaches the failure MODE, not its unconditional frequency; across arbitrary seeds the switch may fall in-train, where the naive protocol accidentally survives. Position sizing is unit notional with no costs; realistic frictions amplify the OOS damage but also reduce the in-sample Sharpe. The break-date estimator (CUSUM argmax) is consistent only for variance breaks large relative to noise, as here."
+  },
+  "agent_instructions": "1. Reproduce the naive protocol exactly: simulate the seeded HMM series, grid-optimize (lookback, entry_z) on the first 70%, record the in-sample Sharpe. 2. BEFORE examining OOS performance, run the CUSUM-of-squares test on the full return series; compare the statistic to the 1.36 Brownian-bridge critical value and record the argmax break date. 3. Verify the scenario: fraction of calm days in train, stress days in OOS, and switch date after the split. 4. Score the frozen strategy on the OOS window; record the collapse. 5. Convict only on the full pattern: scenario realized AND in-sample Sharpe > 1 AND OOS Sharpe < 0 AND break detected — then print flaw_type=REGIME_OVERFITTING and verdict=REJECTED_REGIME_OVERFITTING. 6. Run the no-stress control (P_CALM_TO_STRESS=0) and confirm the audit refuses to convict a stationary series. 7. In the final report, mandate a structural-break test and regime-conditional decomposition for every chronological-split backtest.",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": [
+      "RESULTS",
+      "in_sample_sharpe=",
+      "oos_sharpe=",
+      "cusum_statistic=",
+      "cusum_critical_5pct=1.36",
+      "cusum_break_day=",
+      "check_scenario_realized=True",
+      "check_break_detected=True",
+      "check_break_located_near_switch=True",
+      "flaw_type=REGIME_OVERFITTING",
+      "audit_verdict=REJECTED_REGIME_OVERFITTING",
+      "verdict=REJECTED_REGIME_OVERFITTING"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy"
+    ]
+  }
+}

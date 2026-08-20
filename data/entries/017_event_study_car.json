@@ -1,0 +1,87 @@
+{
+  "schema_version": 2,
+  "entry_kind": "correct",
+  "expected_verdict": "EVENT_STUDY_VERIFIED",
+  "flaws": [],
+  "static_checks": {
+    "require_vectorized": true,
+    "forbid_pandas_row_loops": true,
+    "allowed_sequential_loops": []
+  },
+  "rlm": {
+    "environment_class": null,
+    "actions": [],
+    "max_recursion_depth": 1,
+    "tool_timeout_seconds": 120
+  },
+  "training_sequence": {
+    "style": "tool_use",
+    "include_adversarial_critique": true,
+    "include_final_calibrated_answer": true,
+    "loss_masking": {
+      "user": 0.0,
+      "environment_observation": 0.0,
+      "assistant_thought": 1.0,
+      "tool_call": 1.0,
+      "final_answer": 1.0
+    }
+  },
+  "metadata": {
+    "id": "qlm1-000017-event-study-car",
+    "domain": "Equity / Event Studies",
+    "complexity": 6,
+    "tags": [
+      "event-study",
+      "cumulative-abnormal-returns",
+      "market-model",
+      "estimation-window",
+      "attenuation-bias",
+      "ols",
+      "cross-sectional-aggregation",
+      "statsmodels"
+    ]
+  },
+  "agent_thought_process": {
+    "initial_analysis": "The request 'measure the announcement effect via CAR' decomposes into three claims that must each be verified against known ground truth: (1) the market-model betas estimated on the clean window [-250, -30] recover the true betas; (2) the pooled CAR over [-5, +5] captures the planted +2% abnormal return within sampling error and is statistically significant; (3) the canonical bug — estimating the model on a short recent window [-15, +5] that CONTAINS the event — attenuates the measured CAR toward zero, because the +2% event day inflates the estimated intercept, which is then subtracted back out of every abnormal return. The attenuation is mechanical (roughly CAR_window_length x jump / estimation_window_length), so the bug shrinks precisely the effect being measured — the most dangerous kind of bias because it biases toward 'no result', which reviewers rarely challenge.",
+    "tool_selection": "Python REPL with numpy for the 120-event panel (per-firm OLS in closed form, vectorized across firms via the shared normal-equation structure) and statsmodels OLS for the illustrative single-firm regression with standard errors — the object a referee actually inspects.",
+    "recursive_delegation": "Not needed for one event type. A multi-event-type study (earnings, splits, index adds) would delegate one sub-agent per event type running the identical clean-window protocol, with the parent enforcing a single pre-registered event-window definition so per-type CARs are comparable and not window-shopped."
+  },
+  "research_corpus": {
+    "hypothesis_formulation": "H0 (all must hold for EVENT_STUDY_VERIFIED): (a) mean absolute beta error from the clean estimation window < 0.15 and the single-firm statsmodels beta within 2 standard errors of truth; (b) pooled clean CAR within 2.5 standard errors of the true +2% and its t-statistic > 3 (the study has power, not just unbiasedness); (c) the contaminated-window CAR is strictly below the clean CAR with attenuation > 15% — demonstrating the bias direction and materiality. Any failure yields EVENT_STUDY_FAILED. The +2% jump, betas, and all windows are known by construction, so every check is against ground truth rather than convention.",
+    "data_engineering": "120 seeded independent event histories of 258 days each (day 0 at index 252): true betas U(0.8, 1.5), market factor 16% annualized with 7.5bp daily drift, idiosyncratic vol 1.5%/day — realistic single-name noise, which is exactly why single-stock CARs are underpowered (single-event CAR sigma = sqrt(11)x1.5% ~ 5%) and cross-sectional pooling is load-bearing: the pooled standard error shrinks by sqrt(120) to ~45bp, giving t ~ 4-5 on a 2% effect. Each firm receives the +2% abnormal return on its own day 0. On real data this maps to aligning firms in event time, using each firm's actual announcement date, and winsorizing confounding events out of the estimation window.",
+    "methodology_justification": "The market model r_it = alpha_i + beta_i r_mt + eps_it estimated on [-250, -30] is the classical Brown-Warner design; the -30 buffer keeps pre-announcement drift and information leakage out of the parameter estimates. The contaminated design [-15, +5] is not a strawman — 'use the freshest data before the event' is genuinely tempting reasoning that practitioners follow; its intercept absorbs 2%/21 trading days ~ 9.5bp/day, and over the 11-day CAR window that subtracts ~1.05% from a 2% effect (~50% attenuation, realized 45-78% across seeds once estimation noise is included). Because all firms share the regressor STRUCTURE, the 120 per-firm regressions collapse to one vectorized closed-form pass; statsmodels is reserved for the single regression where standard errors and diagnostics matter.",
+    "code_implementation": "\"\"\"Event study via Cumulative Abnormal Returns (CAR) around a synthetic\nearnings announcement, with the estimation-window contamination bug\ndemonstrated and rejected.\n\nLessons encoded: (1) The market-model parameters (alpha, beta) MUST be\nestimated on a window that does not overlap the event window: the clean\nconvention here is [-250, -30] vs an event window of [-5, +5]. (2) The\ncommon bug — estimating the model on a short recent window that includes\nthe event ([-15, +5], 'use the freshest data') — lets the +2% abnormal\nday inflate the estimated intercept, which is then subtracted back out\nof every abnormal return: the measured CAR is attenuated toward zero by\nconstruction, shrinking exactly the effect being measured. (3) Single-\nstock CARs are noise-dominated (daily idio vol ~1.5%); the standard cure\nis cross-sectional aggregation over many events, which shrinks the CAR\nstandard error by sqrt(N) and is how published event studies achieve\nsignificance. statsmodels OLS provides the illustrative single-firm\nregression with standard errors; the N-firm panel is estimated in one\nvectorized lstsq because all firms share the market regressor.\nDeterministic (seeded).\n\"\"\"\n\nfrom __future__ import annotations\n\nimport numpy as np\nimport statsmodels.api as sm\n\nRNG_SEED = 17\nN_EVENTS = 120                # events pooled cross-sectionally\nN_DAYS = 258                  # trading days per event history\nEVENT_IDX = 252               # day 0 (the announcement) at index 252\nDAY0_OFFSET = EVENT_IDX\nEST_CLEAN = (-250, -30)       # clean estimation window, relative days\nEST_DIRTY = (-15, 5)          # contaminated: overlaps the event window\nEVENT_WIN = (-5, 5)           # CAR window, relative days\nTRUE_ABNORMAL = 0.02          # +2% true abnormal return on day 0\nTRUE_ALPHA = 0.0\nBETA_LO, BETA_HI = 0.8, 1.5\nANN = 252\nMKT_VOL = 0.16 / np.sqrt(ANN)\nMKT_DRIFT = 0.0003\nIDIO_VOL = 0.015              # realistic 1.5% daily idiosyncratic vol\n\n\ndef simulate_events(seed: int) -> tuple:\n    \"\"\"N independent single-firm event histories sharing nothing but the\n    data-generating law: r_it = alpha + beta_i * r_mt + eps_it, plus a\n    known +2% abnormal return on each firm's day 0.\"\"\"\n    rng = np.random.default_rng(seed)\n    betas = rng.uniform(BETA_LO, BETA_HI, N_EVENTS)\n    mkt = MKT_DRIFT + MKT_VOL * rng.standard_normal((N_DAYS, N_EVENTS))\n    eps = IDIO_VOL * rng.standard_normal((N_DAYS, N_EVENTS))\n    rets = TRUE_ALPHA + betas[None, :] * mkt + eps\n    rets[EVENT_IDX, :] += TRUE_ABNORMAL\n    return rets, mkt, betas\n\n\ndef rel(idx: int) -> int:\n    \"\"\"Relative event day -> array index.\"\"\"\n    return DAY0_OFFSET + idx\n\n\ndef estimate_market_model(rets: np.ndarray, mkt: np.ndarray,\n                          window: tuple) -> tuple:\n    \"\"\"Per-firm (alpha, beta) on the given relative-day window. Each firm\n    has its own market draw, so the per-firm normal equations are solved\n    in closed form, fully vectorized across firms.\"\"\"\n    lo, hi = rel(window[0]), rel(window[1]) + 1\n    x = mkt[lo:hi]\n    y = rets[lo:hi]\n    xm = x - x.mean(axis=0, keepdims=True)\n    ym = y - y.mean(axis=0, keepdims=True)\n    beta = (xm * ym).sum(axis=0) / (xm ** 2).sum(axis=0)\n    alpha = y.mean(axis=0) - beta * x.mean(axis=0)\n    return alpha, beta\n\n\ndef car(rets: np.ndarray, mkt: np.ndarray, alpha: np.ndarray,\n        beta: np.ndarray) -> np.ndarray:\n    \"\"\"Per-firm cumulative abnormal return over the event window.\"\"\"\n    lo, hi = rel(EVENT_WIN[0]), rel(EVENT_WIN[1]) + 1\n    ar = rets[lo:hi] - (alpha[None, :] + beta[None, :] * mkt[lo:hi])\n    return ar.sum(axis=0)\n\n\ndef main() -> None:\n    rets, mkt, betas = simulate_events(RNG_SEED)\n\n    # --- Clean methodology: estimation window disjoint from the event ---\n    a_c, b_c = estimate_market_model(rets, mkt, EST_CLEAN)\n    car_clean = car(rets, mkt, a_c, b_c)\n    mean_car = float(car_clean.mean())\n    se_car = float(car_clean.std(ddof=1) / np.sqrt(N_EVENTS))\n    t_car = mean_car / se_car\n\n    # --- The bug: short recent window that CONTAINS the event ----------\n    a_d, b_d = estimate_market_model(rets, mkt, EST_DIRTY)\n    car_dirty = car(rets, mkt, a_d, b_d)\n    mean_car_dirty = float(car_dirty.mean())\n    attenuation = 1.0 - mean_car_dirty / mean_car\n\n    # --- Illustrative single-firm OLS with statsmodels (firm 0) --------\n    lo, hi = rel(EST_CLEAN[0]), rel(EST_CLEAN[1]) + 1\n    X = sm.add_constant(mkt[lo:hi, 0])\n    fit = sm.OLS(rets[lo:hi, 0], X).fit()\n    b0_hat, b0_se = float(fit.params[1]), float(fit.bse[1])\n\n    beta_err = float(np.abs(b_c - betas).mean())\n\n    print(\"RESULTS\")\n    print(f\"n_events={N_EVENTS}\")\n    print(f\"true_abnormal_return={TRUE_ABNORMAL}\")\n    print(f\"true_beta={float(betas.mean()):.4f}\")\n    print(f\"estimated_beta={float(b_c.mean()):.4f}\")\n    print(f\"mean_abs_beta_error={beta_err:.4f}\")\n    print(f\"firm0_beta_true={float(betas[0]):.4f}\")\n    print(f\"firm0_beta_ols={b0_hat:.4f}\")\n    print(f\"firm0_beta_ols_se={b0_se:.4f}\")\n    print(f\"car_event_window={mean_car:.4f}\")\n    print(f\"car_standard_error={se_car:.4f}\")\n    print(f\"car_t_stat={t_car:.2f}\")\n    print(f\"car_event_window_contaminated={mean_car_dirty:.4f}\")\n    print(f\"attenuation_from_contamination={attenuation:.3f}\")\n\n    checks = {\n        # Betas recovered from the clean window (no attenuation there).\n        \"betas_recovered\": beta_err < 0.15,\n        \"firm0_ols_within_2se\": abs(b0_hat - betas[0]) < 2.0 * b0_se,\n        # The pooled clean CAR captures the +2% jump within 2 SEs and is\n        # strongly significant.\n        \"car_captures_jump\": abs(mean_car - TRUE_ABNORMAL) < 2.5 * se_car,\n        \"car_significant\": t_car > 3.0,\n        # Contamination attenuates the measured effect toward zero.\n        \"contamination_attenuates_car\": attenuation > 0.15,\n        \"contaminated_below_clean\": mean_car_dirty < mean_car,\n    }\n    for name, passed in checks.items():\n        print(f\"check_{name}={passed}\")\n    ok = all(checks.values())\n    print(f\"verdict={'EVENT_STUDY_VERIFIED' if ok else 'EVENT_STUDY_FAILED'}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    "statistical_validation": "Deterministic values at seed 17: mean true beta 1.12 vs estimated 1.10 (mean absolute error 0.076); firm-0 statsmodels beta 1.459 vs true 1.392 with SE 0.082 (within 1 SE); pooled clean CAR 1.94% vs true 2.00% with SE 0.42%, t = 4.67; contaminated CAR 0.63% — attenuation 67%. Cross-seed robustness at {1, 7, 17, 42, 99, 314, 2026}: all six checks pass in every seed; clean CAR spans 1.94%-2.69% (always within 2.5 SE of truth) while attenuation spans 45%-78% — the bias is one-sided in every draw, never a wash.",
+    "risk_and_backtest_audit": "What the design controls: estimation/event window separation, cross-sectional power, ground-truth verification of both bias and power. What real studies must additionally handle: event-date clustering (contemporaneous events correlate residuals across firms, understating the pooled SE — calendar-time portfolios or Boehmer-Musumeci corrections), event-induced variance (announcement days have inflated idio vol, biasing standardized tests), confounding events inside the estimation window, and non-synchronous trading. The attenuation lesson generalizes: ANY procedure that lets the measured effect contaminate its own benchmark — peeking event days into betas, normalizing by post-event data, demeaning across the full sample — shrinks the estimate toward zero and produces false negatives, the failure mode least likely to be audited because 'no effect' feels conservative."
+  },
+  "adversarial_critique": {
+    "potential_pitfalls": "(1) Attenuation bias is self-hiding: it biases toward zero, and null results are rarely re-audited — the contaminated study 'finds' a 0.6% effect where 2% exists and everyone moves on. (2) The single-stock version of this study is hopeless by arithmetic (5% CAR noise vs 2% effect); reporting a single-firm CAR without the pooled design is noise laundering. (3) The -30 buffer is not decoration: shrinking it re-admits pre-announcement drift into the betas, a milder cousin of the same contamination. (4) The clean window must also be checked for CONFOUNDING events — this simulation plants exactly one jump, but real estimation windows contain other announcements that violate the market-model error assumptions. (5) With 120 events the 2.5-SE capture check is a calibrated acceptance region, not a rubber stamp — roughly 1% of honest seeds would fail it by chance, which is the correct price of a falsifiable check.",
+    "falsification_strategy": "(a) Set the true abnormal return to 0: the clean CAR must be statistically indistinguishable from zero (|t| < 2 in most seeds) — the design does not manufacture effects. (b) Extend the contaminated window to [-250, +5]: attenuation must shrink toward 11/256 x 2% ~ 9bp — the bias scales inversely with window length exactly as the intercept arithmetic predicts. (c) Double idiosyncratic vol: the t-statistic must fall by ~sqrt(2) while the CAR point estimate stays unbiased — power and bias are separate properties. (d) Shuffle event days across firms: the pooled CAR must collapse to zero, confirming alignment in event time is what isolates the effect.",
+    "limitations": "The market model with constant beta is the simplest benchmark; Fama-French factor models change abnormal-return magnitudes in real data (though not the window-contamination logic, which is model-agnostic). Independence across the 120 events is by construction here; clustered real events need robust pooled inference. The event is a clean one-day jump — multi-day information leakage spreads the effect across the window and interacts with the buffer choice. CAR itself assumes additive abnormal returns; long-horizon studies need BHAR and face different (skewness) inference problems."
+  },
+  "agent_instructions": "1. Simulate the 120 seeded event histories with known betas and the +2% day-0 abnormal return. 2. Estimate per-firm market models on the CLEAN window [-250, -30] via the vectorized closed form; verify beta recovery (mean |error| < 0.15) and run the illustrative statsmodels OLS for firm 0 with standard errors. 3. Compute per-firm CARs over [-5, +5] and pool: report mean, SE, and t; require the mean within 2.5 SE of +2% and t > 3. 4. Re-estimate on the contaminated window [-15, +5] and recompute the CAR; require attenuation > 15% and the contaminated CAR strictly below the clean one. 5. Emit verdict=EVENT_STUDY_VERIFIED only if all checks pass. 6. Run the zero-effect control (no planted jump) and confirm the design reports no effect. 7. In the final report, state the general rule: the measured effect must never participate in estimating its own benchmark.",
+  "verification": {
+    "timeout_seconds": 120,
+    "must_print": [
+      "RESULTS",
+      "n_events=120",
+      "true_abnormal_return=0.02",
+      "true_beta=",
+      "estimated_beta=",
+      "car_event_window=",
+      "car_t_stat=",
+      "car_event_window_contaminated=",
+      "attenuation_from_contamination=",
+      "check_betas_recovered=True",
+      "check_car_captures_jump=True",
+      "check_car_significant=True",
+      "check_contamination_attenuates_car=True",
+      "verdict=EVENT_STUDY_VERIFIED"
+    ],
+    "forbid_nan_in_stdout": true,
+    "required_packages": [
+      "numpy",
+      "statsmodels"
+    ]
+  }
+}
